@@ -1,0 +1,91 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install ruff && ruff check --select E,F,W,B --ignore E501 config-me tests
+      - run: python -m unittest discover -s tests -v
+
+  # Real installs in a fresh Ubuntu container, run as a normal user with sudo (like a new VM/WSL distro).
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "ubuntu:22.04"]
+        scenario: [blang, yes, managers]
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Base packages + a sudo user
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends python3 sudo curl ca-certificates git
+          useradd -m -s /bin/bash dev
+          echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
+      - uses: actions/checkout@v5
+      - name: Copy repo for the dev user
+        run: cp -r "$GITHUB_WORKSPACE" /home/dev/linux-config && chown -R dev:dev /home/dev/linux-config
+
+      - name: "-blang: every language at LTS"
+        if: matrix.scenario == 'blang'
+        run: su - dev -c 'cd linux-config && ./config-me -blang -mute'
+
+      - name: "-y: accept every default (all languages, Docker, all AI CLIs)"
+        if: matrix.scenario == 'yes'
+        run: su - dev -c 'cd linux-config && ./config-me -y'
+
+      - name: "interactive: version managers (answers piped to stdin)"
+        if: matrix.scenario == 'managers'
+        run: |
+          # langs: node java go python | node: LTS via nvm | java 21 via sdkman | go latest via mise
+          # python (system copy is detected → update alongside) 3.12 via uv | engine: podman
+          # AI: claude + copilot | confirm
+          su - dev -c 'cd linux-config && printf "%s\n" "1 3 4 5" "" nvm 21 sdkman latest mise u 3.12 uv 2 "" "1 3" "" "" y | ./config-me'
+
+      - name: "-stat reports what was installed"
+        run: |
+          su - dev -c 'cd linux-config && ./config-me -stat' | tee /tmp/stat.txt
+          case "${{ matrix.scenario }}" in
+            blang)    expect="Node.js|C#|Java|Go|Python|Rust" ;;
+            yes)      expect="Node.js|C#|Java|Go|Python|Rust|Docker|Claude|Codex|Copilot|Gemini" ;;
+            managers) expect="Node.js|Java|Go|Python|Podman|Claude|Copilot" ;;
+          esac
+          for name in $(echo "$expect" | tr '|' ' '); do
+            grep -E "●.*$name" /tmp/stat.txt >/dev/null || { echo "::error::-stat doesn't show $name as installed"; exit 1; }
+          done
+          if [ "${{ matrix.scenario }}" = yes ] && grep -E "●.*containerd" /tmp/stat.txt; then
+            echo "::error::Docker's bundled containerd must not be reported as a separate engine"; exit 1
+          fi
+
+      - name: Tools work in a new login shell
+        run: |
+          su - dev -c 'bash -ic "
+            set -e
+            case ${{ matrix.scenario }} in
+              blang|yes) node --version; npm --version; dotnet --version; java -version; go version; rustc --version; cargo --version
+                         ls /usr/bin/python3.* ;;
+              managers)  node --version; java -version; go version; uv python find; copilot --version; claude --version ;;
+            esac
+            if [ ${{ matrix.scenario }} = yes ]; then docker --version; claude --version; codex --version; gemini --version; copilot --version; fi
+          "'
+
+      - name: "-rm ai, then -rm everything"
+        run: |
+          su - dev -c 'cd linux-config && ./config-me -rm ai -y && ./config-me -rm -y && ./config-me -stat' | tee /tmp/after.txt
+          # nothing config-me manages should be left (system python3 is the only allowed survivor)
+          if grep -E "●" /tmp/after.txt | grep -v -E "Python .*not managed"; then echo "left over after -rm"; exit 1; fi

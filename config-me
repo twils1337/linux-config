@@ -1,0 +1,1904 @@
+#!/usr/bin/env python3
+"""config-me: set up a fresh Ubuntu VM or WSL distro.
+
+Interactive sections:
+  1. Languages        (multi-select)  Node, C#/.NET, Java, Go, Python, Rust
+  2. Container engine (single-select) Docker, Podman, containerd (+nerdctl)
+  3. AI CLI tools     (multi-select)  Claude Code, OpenAI Codex, GitHub Copilot, Gemini
+
+Run `config-me -h` for flags. Standard library only; needs Python 3.8+ and Ubuntu (apt).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import getpass
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+VERSION = "1.0.0"
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / "config-me"
+STATE_FILE = STATE_DIR / "state.json"
+LOG_FILE = STATE_DIR / "config-me.log"
+LOCAL_BIN = HOME / ".local" / "bin"
+RC_BEGIN = "# >>> config-me >>>"
+RC_END = "# <<< config-me <<<"
+APT_MAX_AGE_SECS = 6 * 3600  # refresh package lists if older than this
+
+SECTIONS = {
+    "lang": "Languages",
+    "containers": "Container engine",
+    "ai": "AI CLI tools",
+}
+SECTION_ALIASES = {
+    "lang": "lang", "langs": "lang", "language": "lang", "languages": "lang",
+    "container": "containers", "containers": "containers", "images": "containers",
+    "image": "containers", "engine": "containers",
+    "ai": "ai", "ai-tools": "ai", "ais": "ai", "providers": "ai",
+}
+
+
+# =============================================================================
+# Output: colours, logging, progress bar
+# =============================================================================
+
+class UI:
+    def __init__(self, mute: bool = False):
+        self.mute = mute
+        self.tty = sys.stdout.isatty()
+        self.color = self.tty and not os.environ.get("NO_COLOR")
+        self._log_fh = None
+        self._bar: Optional[Tuple[int, int, str]] = None
+        self._lock = threading.Lock()
+
+    # -- colours -------------------------------------------------------------
+    def c(self, text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def bold(self, t: str) -> str: return self.c(t, "1")
+    def dim(self, t: str) -> str: return self.c(t, "2")
+    def green(self, t: str) -> str: return self.c(t, "32")
+    def yellow(self, t: str) -> str: return self.c(t, "33")
+    def red(self, t: str) -> str: return self.c(t, "31")
+    def cyan(self, t: str) -> str: return self.c(t, "36")
+
+    # -- log file ------------------------------------------------------------
+    def open_log(self) -> None:
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            self._log_fh = open(LOG_FILE, "a", encoding="utf-8")
+            self._log_fh.write(f"\n===== config-me {VERSION} run at {_dt.datetime.now().isoformat()} =====\n")
+        except OSError:
+            self._log_fh = None
+
+    def to_file(self, line: str) -> None:
+        if self._log_fh:
+            self._log_fh.write(line.rstrip("\n") + "\n")
+            self._log_fh.flush()
+
+    # -- messages ------------------------------------------------------------
+    def _emit(self, line: str, plain: str, force: bool = False) -> None:
+        self.to_file(plain)
+        if self.mute and not force:
+            return
+        with self._lock:
+            self._clear_bar()
+            print(line, flush=True)
+            self._draw_bar()
+
+    def step(self, msg: str) -> None: self._emit(self.bold(self.cyan("==> ")) + self.bold(msg), f"==> {msg}")
+    def info(self, msg: str) -> None: self._emit("    " + msg, f"    {msg}")
+    def ok(self, msg: str) -> None: self._emit(self.green("  ✓ ") + msg, f"  OK {msg}")
+    def warn(self, msg: str) -> None: self._emit(self.yellow("  ! ") + msg, f"  WARN {msg}", force=True)
+    def error(self, msg: str) -> None: self._emit(self.red("  ✗ ") + msg, f"  ERROR {msg}", force=True)
+    def cmd(self, msg: str) -> None: self._emit(self.dim("  $ " + msg), f"  $ {msg}")
+    def out(self, msg: str) -> None: self._emit(self.dim("  │ " + msg), f"  | {msg}")
+
+    def say(self, msg: str = "") -> None:
+        """Always shown (prompts, summaries), never only logged."""
+        self.to_file(re.sub(r"\033\[[0-9;]*m", "", msg))
+        with self._lock:
+            self._clear_bar()
+            print(msg, flush=True)
+            self._draw_bar()
+
+    # -- progress bar (used with -mute) ----------------------------------------
+    def bar(self, done: int, total: int, label: str) -> None:
+        if not self.mute:
+            return
+        with self._lock:
+            self._bar = (done, total, label)
+            self._draw_bar()
+
+    def end_bar(self) -> None:
+        with self._lock:
+            self._clear_bar()
+            self._bar = None
+
+    def _draw_bar(self) -> None:
+        if not (self.mute and self._bar):
+            return
+        done, total, label = self._bar
+        width = 30
+        filled = int(width * done / total) if total else width
+        pct = int(100 * done / total) if total else 100
+        cols = shutil.get_terminal_size((100, 20)).columns
+        text = f"[{'█' * filled}{'░' * (width - filled)}] {pct:3d}% ({done}/{total}) {label}"
+        text = text[: max(10, cols - 1)]
+        if self.tty:
+            sys.stdout.write("\r\033[K" + text)
+            sys.stdout.flush()
+        else:
+            print(text, flush=True)
+
+    def _clear_bar(self) -> None:
+        if self.mute and self._bar and self.tty:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
+# =============================================================================
+# Running commands
+# =============================================================================
+
+class CommandError(RuntimeError):
+    pass
+
+
+class Runner:
+    def __init__(self, ui: UI, dry_run: bool = False):
+        self.ui = ui
+        self.dry_run = dry_run
+        self.is_root = os.geteuid() == 0
+        self._sudo_ok = self.is_root
+
+    def env(self) -> Dict[str, str]:
+        env = dict(os.environ)
+        extra = [
+            str(LOCAL_BIN), str(HOME / ".cargo" / "bin"), str(HOME / ".dotnet"),
+            str(HOME / ".local" / "share" / "fnm"), str(HOME / ".pyenv" / "bin"),
+            "/usr/local/go/bin", str(HOME / "go" / "bin"),
+            str(HOME / ".local" / "share" / "mise" / "shims"),
+        ]
+        env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+        env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+        return env
+
+    def ensure_sudo(self) -> None:
+        if self._sudo_ok or self.dry_run:
+            return
+        if not shutil.which("sudo"):
+            raise CommandError("this step needs root, but sudo isn't installed (run config-me as root)")
+        self.ui.end_bar()
+        self.ui.say(self.ui.dim("    (sudo is needed for system packages)"))
+        if subprocess.call(["sudo", "-v"]) != 0:
+            raise CommandError("sudo authentication failed")
+        self._sudo_ok = True
+        threading.Thread(target=self._keep_sudo_alive, daemon=True).start()
+
+    @staticmethod
+    def _keep_sudo_alive() -> None:
+        while True:
+            time.sleep(60)
+            subprocess.call(["sudo", "-n", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def run(self, cmd: str, sudo: bool = False, check: bool = True, quiet: bool = False,
+            env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+        """Run a bash command line. Returns (exit code, combined output)."""
+        if sudo and not self.is_root:
+            self.ensure_sudo()
+            full = ["sudo", "-E", "bash", "-o", "pipefail", "-c", cmd]
+        else:
+            full = ["bash", "-o", "pipefail", "-c", cmd]
+        self.ui.cmd(("sudo " if sudo and not self.is_root else "") + cmd)
+        if self.dry_run:
+            return 0, ""
+        run_env = self.env()
+        if env:
+            run_env.update(env)
+        proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, env=run_env, text=True,
+                                errors="replace", bufsize=1)
+        lines: List[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            lines.append(line)
+            if quiet:
+                self.ui.to_file("  | " + line)
+            else:
+                self.ui.out(line)
+        code = proc.wait()
+        output = "\n".join(lines)
+        if check and code != 0:
+            tail = "\n".join(lines[-15:])
+            raise CommandError(f"command failed (exit {code}): {cmd}\n{tail}")
+        return code, output
+
+    # Version managers that only work once their init script is sourced (as a login shell would).
+    PROBE_PRELUDE = (
+        '[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1; '
+        '[ -s "$HOME/.sdkman/bin/sdkman-init.sh" ] && . "$HOME/.sdkman/bin/sdkman-init.sh" >/dev/null 2>&1; '
+        '[ -x "$HOME/.local/share/fnm/fnm" ] && eval "$("$HOME/.local/share/fnm/fnm" env)" >/dev/null 2>&1; '
+        '[ -x "$HOME/.pyenv/bin/pyenv" ] && eval "$("$HOME/.pyenv/bin/pyenv" init - bash)" >/dev/null 2>&1; '
+        "true; "
+    )
+
+    def capture(self, cmd: str) -> Optional[str]:
+        """Run a read-only probe command, even in dry-run. Returns stdout or None."""
+        try:
+            res = subprocess.run(["bash", "-c", self.PROBE_PRELUDE + cmd], capture_output=True, text=True,
+                                 env=self.env(), timeout=30, errors="replace")
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if res.returncode != 0:
+            return None
+        return (res.stdout + res.stderr).strip()
+
+
+def q(s: str) -> str:
+    return shlex.quote(s)
+
+
+# =============================================================================
+# Networking & versions
+# =============================================================================
+
+_HTTP_CACHE: Dict[str, object] = {}
+
+
+def http_json(url: str) -> object:
+    if url in _HTTP_CACHE:
+        return _HTTP_CACHE[url]
+    req = urllib.request.Request(url, headers={"User-Agent": f"config-me/{VERSION}",
+                                               "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    _HTTP_CACHE[url] = data
+    return data
+
+
+def http_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": f"config-me/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def strip_prefix(s: str, prefix: str) -> str:
+    return s[len(prefix):] if s.startswith(prefix) else s
+
+
+def vkey(v: str) -> Tuple[int, ...]:
+    """Sort key for version strings: '1.22.10' > '1.22.9'."""
+    return tuple(int(x) for x in re.findall(r"\d+", v)) or (0,)
+
+
+def pick_version(candidates: Sequence[str], spec: str) -> Optional[str]:
+    """Pick the newest candidate matching `spec` ('22' → newest 22.x, '22.1.0' → exact)."""
+    spec = spec.lstrip("vV").strip()
+    parts = spec.split(".")
+    matches = []
+    for c in candidates:
+        cv = c.lstrip("vV")
+        cparts = re.split(r"[.]", cv)
+        if cv == spec or cparts[: len(parts)] == parts:
+            matches.append(c)
+    return max(matches, key=vkey) if matches else None
+
+
+def arch() -> Tuple[str, str]:
+    """(dpkg/go-style arch, node/rust-style arch)."""
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return "amd64", "x64"
+    if m in ("aarch64", "arm64"):
+        return "arm64", "arm64"
+    return m, m
+
+
+def is_wsl() -> bool:
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+def has_systemd() -> bool:
+    try:
+        return Path("/proc/1/comm").read_text().strip() == "systemd"
+    except OSError:
+        return False
+
+
+def ubuntu_codename() -> str:
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("VERSION_CODENAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "noble"
+
+
+def target_user() -> str:
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+# =============================================================================
+# apt (with smart `apt-get update`)
+# =============================================================================
+
+class Apt:
+    LOCK = "-o DPkg::Lock::Timeout=300"
+
+    def __init__(self, runner: Runner):
+        self.r = runner
+        self.fresh = False
+
+    def lists_age(self) -> float:
+        lists = Path("/var/lib/apt/lists")
+        newest = 0.0
+        try:
+            for p in lists.iterdir():
+                if p.is_file() and p.name not in ("lock",):
+                    newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            return float("inf")
+        return time.time() - newest if newest else float("inf")
+
+    def update(self, force: bool = False) -> None:
+        """Run apt-get update once per run, and only when lists are stale or a repo changed."""
+        if self.fresh and not force:
+            return
+        if not force and self.lists_age() < APT_MAX_AGE_SECS:
+            self.r.ui.info(self.r.ui.dim("package lists are fresh; skipping apt-get update"))
+            self.fresh = True
+            return
+        self.r.run(f"apt-get {self.LOCK} update -y", sudo=True)
+        self.fresh = True
+
+    def install(self, *pkgs: str) -> None:
+        if not pkgs:
+            return
+        self.update()
+        self.r.run(f"apt-get {self.LOCK} install -y --no-install-recommends {' '.join(pkgs)}", sudo=True)
+
+    def purge(self, *pkgs: str) -> None:
+        installed = [p for p in pkgs if self.installed(p) or "*" in p]
+        if installed:
+            self.r.run(f"apt-get {self.LOCK} purge -y {' '.join(installed)} && apt-get {self.LOCK} autoremove -y",
+                       sudo=True, check=False)
+
+    def installed(self, pkg: str) -> bool:
+        out = self.r.capture(f"dpkg-query -W -f='${{Status}}' {q(pkg)} 2>/dev/null")
+        return bool(out and "install ok installed" in out)
+
+    def version(self, pkg: str) -> Optional[str]:
+        return self.r.capture(f"dpkg-query -W -f='${{Version}}' {q(pkg)} 2>/dev/null") if self.installed(pkg) else None
+
+    def candidates(self, pkg: str) -> List[str]:
+        out = self.r.capture(f"apt-cache madison {q(pkg)}") or ""
+        return [line.split("|")[1].strip() for line in out.splitlines() if line.count("|") >= 2]
+
+    def add_repo(self, name: str, key_url: str, source: str, armored_key: bool = True) -> None:
+        """Add a signed third-party repository (keyring in /etc/apt/keyrings)."""
+        self.install("ca-certificates", "curl", "gnupg")
+        key = f"/etc/apt/keyrings/{name}.gpg"
+        fetch = f"curl -fsSL --retry 3 --retry-delay 2 {q(key_url)}"
+        dearmor = f" | gpg --dearmor --yes -o {key}" if armored_key else f" -o {key}"
+        self.r.run(f"install -m 0755 -d /etc/apt/keyrings && {fetch}{dearmor} && chmod a+r {key}", sudo=True)
+        line = source.replace("{key}", key)
+        self.r.run(f"echo {q(line)} > /etc/apt/sources.list.d/{name}.list", sudo=True)
+        self.update(force=True)
+
+    def remove_repo(self, name: str) -> None:
+        self.r.run(f"rm -f /etc/apt/sources.list.d/{name}.list /etc/apt/keyrings/{name}.gpg", sudo=True, check=False)
+        self.fresh = False
+
+
+# =============================================================================
+# Shell rc integration (~/.bashrc, ~/.zshrc)
+# =============================================================================
+
+class ShellRc:
+    """Manages a marked block in shell rc files. Each line is tagged `# config-me:<tag>`."""
+
+    def __init__(self, ui: UI, dry_run: bool = False):
+        self.ui = ui
+        self.dry_run = dry_run
+
+    @staticmethod
+    def files() -> List[Path]:
+        files = [HOME / ".bashrc"]
+        if (HOME / ".zshrc").exists():
+            files.append(HOME / ".zshrc")
+        return files
+
+    @staticmethod
+    def _split(text: str) -> Tuple[str, List[str], str]:
+        if RC_BEGIN in text and RC_END in text:
+            pre, rest = text.split(RC_BEGIN, 1)
+            body, post = rest.split(RC_END, 1)
+            return pre, [line for line in body.strip("\n").splitlines() if line.strip()], post
+        return text, [], ""
+
+    @staticmethod
+    def _join(pre: str, body: List[str], post: str) -> str:
+        if not body:
+            return pre.rstrip("\n") + ("\n" if pre.strip() else "") + post.lstrip("\n")
+        block = "\n".join([RC_BEGIN, "# Managed by config-me. Edit with care; lines are added/removed by tag.", *body, RC_END])
+        sep = "" if not pre or pre.endswith("\n\n") else ("\n" if pre.endswith("\n") else "\n\n")
+        return pre + sep + block + "\n" + post.lstrip("\n")
+
+    def add(self, tag: str, *lines: str) -> None:
+        for f in self.files():
+            text = f.read_text() if f.exists() else ""
+            pre, body, post = self._split(text)
+            body = [b for b in body if not b.endswith(f"# config-me:{tag}") and not b.startswith("# Managed by config-me")]
+            body += [f"{line}  # config-me:{tag}" for line in lines]
+            new = self._join(pre, body, post)
+            if new != text:
+                self.ui.info(self.ui.dim(f"updating {f} ({tag})"))
+                if not self.dry_run:
+                    f.write_text(new)
+
+    def remove(self, tag: str) -> None:
+        for f in self.files():
+            if not f.exists():
+                continue
+            text = f.read_text()
+            pre, body, post = self._split(text)
+            kept = [b for b in body if not b.endswith(f"# config-me:{tag}") and not b.startswith("# Managed by config-me")]
+            if len(kept) != len([b for b in body if not b.startswith("# Managed by config-me")]):
+                self.ui.info(self.ui.dim(f"removing {tag} lines from {f}"))
+                if not self.dry_run:
+                    f.write_text(self._join(pre, kept, post))
+
+
+# =============================================================================
+# Persistent state (what config-me installed, and how)
+# =============================================================================
+
+class State:
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
+        try:
+            self.data = json.loads(STATE_FILE.read_text())
+        except (OSError, ValueError):
+            self.data = {"items": {}}
+        self.data.setdefault("items", {})
+
+    def get(self, item_id: str) -> Optional[dict]:
+        return self.data["items"].get(item_id)
+
+    def set(self, item_id: str, **info: str) -> None:
+        info["updated"] = _dt.datetime.now().isoformat(timespec="seconds")
+        self.data["items"][item_id] = info
+        self._save()
+
+    def drop(self, item_id: str) -> None:
+        self.data["items"].pop(item_id, None)
+        self._save()
+
+    def _save(self) -> None:
+        if self.dry_run:
+            return
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(self.data, indent=2, sort_keys=True))
+
+
+# =============================================================================
+# Context shared by every item
+# =============================================================================
+
+@dataclass
+class Ctx:
+    ui: UI
+    run: Runner
+    apt: Apt
+    rc: ShellRc
+    state: State
+    dry_run: bool = False
+
+    def sh(self, cmd: str, **kw) -> Tuple[int, str]:
+        return self.run.run(cmd, **kw)
+
+    def probe(self, cmd: str) -> Optional[str]:
+        return self.run.capture(cmd)
+
+
+@dataclass
+class Detected:
+    version: str
+    method: str          # how it was installed (e.g. "tarball", "nvm", "apt", "unknown")
+    path: str = ""
+    managed: bool = True  # False for things config-me must never remove (system python)
+
+
+def first_version(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?(?:[-+._][0-9A-Za-z.]+)?)", text)
+    return m.group(1) if m else None
+
+
+# =============================================================================
+# Shared installers: mise and the npm "user prefix"
+# =============================================================================
+
+MISE = LOCAL_BIN / "mise"
+
+
+def ensure_mise(ctx: Ctx) -> None:
+    if MISE.exists() or shutil.which("mise"):
+        return
+    ctx.ui.info("installing mise (polyglot version manager)")
+    ctx.apt.install("curl", "ca-certificates")
+    ctx.sh("curl -fsSL --retry 3 --retry-delay 2 https://mise.run | sh")
+    ctx.rc.add("mise", 'eval "$($HOME/.local/bin/mise activate $(basename "$SHELL"))"')
+    ctx.state.set("_mise", method="mise.run", version="latest")
+
+
+def mise_bin() -> str:
+    return str(MISE) if MISE.exists() else "mise"
+
+
+def mise_use(ctx: Ctx, tool: str, version: str) -> None:
+    ensure_mise(ctx)
+    ctx.sh(f"{mise_bin()} use --global --yes {q(f'{tool}@{version}')}")
+
+
+def mise_remove(ctx: Ctx, tool: str) -> None:
+    ctx.sh(f"{mise_bin()} unuse --global --yes {q(tool)} || true", check=False)
+    ctx.sh(f"{mise_bin()} uninstall --all --yes {q(tool)} || true", check=False)
+
+
+def mise_has(ctx: Ctx, tool: str) -> Optional[str]:
+    out = ctx.probe(f"{mise_bin()} ls --global --json {q(tool)} 2>/dev/null")
+    try:
+        entries = json.loads(out) if out else []
+        if entries:
+            return entries[-1].get("version")
+    except ValueError:
+        pass
+    return None
+
+
+def ensure_node_for_npm(ctx: Ctx, min_major: int = 20) -> None:
+    out = ctx.probe("node --version")
+    if out and vkey(out)[0] >= min_major and ctx.probe("npm --version"):
+        return
+    ctx.ui.info(f"Node.js {min_major}+ is required; installing the latest Node LTS first")
+    node = ITEMS["node"]
+    node.install(ctx, "lts", node.default_method)
+
+
+NPM_PREFIX = HOME / ".local"
+
+
+def npm_global(ctx: Ctx, args: str) -> None:
+    """npm -g into ~/.local (no sudo, works with any Node install method)."""
+    ctx.sh(f"npm {args} --global --prefix {q(str(NPM_PREFIX))} --no-fund --no-audit")
+
+
+def ensure_local_bin_on_path(ctx: Ctx) -> None:
+    ctx.rc.add("local-bin", 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac')
+
+
+# =============================================================================
+# Items: the software config-me manages
+# =============================================================================
+
+class Item:
+    id = ""
+    name = ""
+    section = ""
+    default_method = ""
+    managers: List[Tuple[str, str]] = []   # (key, description) of optional version managers
+    has_lts = True
+    version_hint_words = ("LTS", "latest")
+
+    # --- versions ---------------------------------------------------------------
+    def lts(self) -> str:
+        return self.latest()
+
+    def latest(self) -> str:
+        raise NotImplementedError
+
+    def resolve(self, ctx: Ctx, spec: str, method: str) -> str:
+        """Turn 'lts' / 'latest' / '22' into what the installer needs."""
+        try:
+            if spec == "lts":
+                return self.lts()
+            if spec == "latest":
+                return self.latest()
+            return self.resolve_specific(spec, method)
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+            if ctx.dry_run:
+                return f"<{spec}>"
+            raise CommandError(f"couldn't look up {self.name} versions: {e}") from e
+
+    def resolve_specific(self, spec: str, method: str) -> str:
+        return spec.lstrip("vV")
+
+    def version_hint(self) -> str:
+        try:
+            lts, latest = self.lts(), self.latest()
+        except Exception:  # noqa: BLE001 - only a hint
+            return ""
+        if not self.has_lts or lts == latest:
+            return f"latest={latest}"
+        return f"LTS={lts}, latest={latest}"
+
+    # --- lifecycle --------------------------------------------------------------
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        raise NotImplementedError
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        raise NotImplementedError
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        raise NotImplementedError
+
+    def method_of(self, ctx: Ctx, default: str = "unknown") -> str:
+        st = ctx.state.get(self.id)
+        return st["method"] if st else default
+
+
+# ----------------------------------------------------------------------------- Node
+
+class Node(Item):
+    id, name, section = "node", "Node.js", "lang"
+    default_method = "official"
+    managers = [("nvm", "nvm (Node Version Manager)"), ("fnm", "fnm (fast, Rust-based)"), ("mise", "mise (polyglot)")]
+    INDEX = "https://nodejs.org/dist/index.json"
+    PREFIX = Path("/usr/local/lib/nodejs")
+
+    def _index(self) -> list:
+        return http_json(self.INDEX)  # type: ignore[return-value]
+
+    def lts(self) -> str:
+        return next(r["version"] for r in self._index() if r.get("lts"))
+
+    def latest(self) -> str:
+        return self._index()[0]["version"]
+
+    def resolve_specific(self, spec: str, method: str) -> str:
+        v = pick_version([r["version"] for r in self._index()], spec)
+        if not v:
+            raise ValueError(f"no Node.js release matches {spec!r}")
+        return v
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("node --version")
+        if not out:
+            return None
+        path = ctx.probe("command -v node") or ""
+        method = self.method_of(ctx, "")
+        if not method:
+            if ".nvm" in path:
+                method = "nvm"
+            elif "fnm" in path:
+                method = "fnm"
+            elif "mise" in path:
+                method = "mise"
+            elif path.startswith("/usr/local/bin") and self.PREFIX.exists():
+                method = "official"
+            elif ctx.apt.installed("nodejs"):
+                method = "apt"
+            else:
+                method = "unknown"
+        return Detected(out.lstrip("v"), method, path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        ctx.apt.install("libatomic1")  # recent Node builds link against it; minimal images lack it
+        if method == "nvm":
+            version = self.resolve(ctx, spec, method).lstrip("v")
+            if not (HOME / ".nvm" / "nvm.sh").exists():
+                ctx.apt.install("curl", "ca-certificates")
+                tag = "v0.40.3"
+                try:
+                    tag = http_json("https://api.github.com/repos/nvm-sh/nvm/releases/latest")["tag_name"]  # type: ignore[index]
+                except Exception:  # noqa: BLE001 - fall back to a known release
+                    pass
+                ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh | PROFILE=/dev/null bash")
+                ctx.rc.add("nvm", 'export NVM_DIR="$HOME/.nvm"', '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"')
+            ctx.sh(f'. "$HOME/.nvm/nvm.sh" && nvm install {q(version)} && nvm alias default {q(version)}')
+        elif method == "fnm":
+            version = self.resolve(ctx, spec, method).lstrip("v")
+            fnm = HOME / ".local" / "share" / "fnm" / "fnm"
+            if not fnm.exists():
+                ctx.apt.install("curl", "unzip", "ca-certificates")
+                ctx.sh('curl -fsSL --retry 3 --retry-delay 2 https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$HOME/.local/share/fnm"')
+                ctx.rc.add("fnm", 'export PATH="$HOME/.local/share/fnm:$PATH"', 'eval "$(fnm env --use-on-cd --shell $(basename "$SHELL"))"')
+            ctx.sh(f"{fnm} install {q(version)} && {fnm} default {q(version)}")
+        elif method == "mise":
+            mise_use(ctx, "node", spec.lstrip("vV"))
+            version = mise_has(ctx, "node") or spec
+        else:
+            version = self.resolve(ctx, spec, method).lstrip("v")
+            _, narch = arch()
+            pkg = f"node-v{version}-linux-{narch}"
+            url = f"https://nodejs.org/dist/v{version}/{pkg}.tar.xz"
+            ctx.apt.install("curl", "xz-utils", "ca-certificates")
+            ctx.sh(
+                f"rm -rf {self.PREFIX} && mkdir -p {self.PREFIX} && "
+                f"curl -fsSL --retry 3 --retry-delay 2 {url} | tar -xJ -C {self.PREFIX} && "
+                f"for b in node npm npx corepack; do ln -sf {self.PREFIX}/{pkg}/bin/$b /usr/local/bin/$b; done",
+                sudo=True,
+            )
+            method = "official"
+        ctx.state.set(self.id, method=method, version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        m = det.method
+        if m == "nvm":
+            ctx.sh('rm -rf "$HOME/.nvm"')
+            ctx.rc.remove("nvm")
+        elif m == "fnm":
+            ctx.sh('rm -rf "$HOME/.local/share/fnm" "$HOME/.local/state/fnm_multishells"')
+            ctx.rc.remove("fnm")
+        elif m == "mise":
+            mise_remove(ctx, "node")
+        elif m == "apt":
+            ctx.apt.purge("nodejs")
+        else:
+            ctx.sh(f"rm -rf {self.PREFIX} && rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack",
+                   sudo=True)
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- .NET
+
+class DotNet(Item):
+    id, name, section = "dotnet", "C# (.NET SDK)", "lang"
+    default_method = "dotnet-install"
+    managers = [("mise", "mise (polyglot)")]
+    INDEX = "https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json"
+    ROOT = HOME / ".dotnet"
+
+    def _channels(self) -> list:
+        data = http_json(self.INDEX)
+        return [c for c in data["releases-index"] if c.get("support-phase") not in ("preview", "eol")]  # type: ignore[index]
+
+    def lts(self) -> str:
+        chans = [c for c in self._channels() if c.get("release-type") == "lts"]
+        return max(chans, key=lambda c: vkey(c["channel-version"]))["latest-sdk"]
+
+    def latest(self) -> str:
+        return max(self._channels(), key=lambda c: vkey(c["channel-version"]))["latest-sdk"]
+
+    def resolve_specific(self, spec: str, method: str) -> str:
+        spec = spec.strip()
+        if spec.count(".") >= 2:          # a full SDK version like 8.0.404
+            return spec
+        chan = spec if "." in spec else f"{spec}.0"
+        data = http_json(self.INDEX)
+        for c in data["releases-index"]:  # type: ignore[index]
+            if c["channel-version"] == chan:
+                return c["latest-sdk"]
+        raise ValueError(f"no .NET channel {chan}")
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("dotnet --list-sdks")
+        if not out:
+            return None
+        versions = [line.split()[0] for line in out.splitlines() if line.strip()]
+        path = ctx.probe("command -v dotnet") or ""
+        method = self.method_of(ctx, "")
+        if not method:
+            method = "mise" if "mise" in path else "dotnet-install" if str(self.ROOT) in path or self.ROOT.exists() else (
+                "apt" if ctx.apt.installed("dotnet-host") or ctx.apt.installed("dotnet-host-8.0") else "unknown")
+        return Detected(", ".join(sorted(versions, key=vkey)), method, path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        ctx.apt.install("curl", "ca-certificates", "libicu-dev")
+        if method == "mise":
+            mise_use(ctx, "dotnet", self.resolve(ctx, spec, method))
+            version = mise_has(ctx, "dotnet") or spec
+        else:
+            version = self.resolve(ctx, spec, method)
+            ctx.sh(f'curl -fsSL --retry 3 --retry-delay 2 https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && '
+                   f'bash /tmp/dotnet-install.sh --version {q(version)} --install-dir "$HOME/.dotnet" && rm -f /tmp/dotnet-install.sh')
+            ctx.rc.add("dotnet", 'export DOTNET_ROOT="$HOME/.dotnet"', 'export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"',
+                       "export DOTNET_CLI_TELEMETRY_OPTOUT=1")
+            method = "dotnet-install"
+        ctx.state.set(self.id, method=method, version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "mise":
+            mise_remove(ctx, "dotnet")
+        elif det.method == "apt":
+            ctx.apt.purge("dotnet*", "aspnetcore*", "netstandard*")
+        else:
+            ctx.sh('rm -rf "$HOME/.dotnet"')
+            ctx.rc.remove("dotnet")
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- Java
+
+class Java(Item):
+    id, name, section = "java", "Java (Eclipse Temurin JDK)", "lang"
+    default_method = "temurin-apt"
+    managers = [("sdkman", "SDKMAN! (the JVM ecosystem's manager)"), ("mise", "mise (polyglot)")]
+    API = "https://api.adoptium.net/v3/info/available_releases"
+
+    def _info(self) -> dict:
+        return http_json(self.API)  # type: ignore[return-value]
+
+    def lts(self) -> str:
+        return str(self._info()["most_recent_lts"])
+
+    def latest(self) -> str:
+        return str(self._info()["most_recent_feature_release"])
+
+    def resolve_specific(self, spec: str, method: str) -> str:
+        if method == "sdkman" and "-" in spec:   # full SDKMAN id like 21.0.5-tem
+            return spec
+        major = spec.split(".")[0]
+        if not major.isdigit():
+            raise ValueError(f"Java versions are majors like 21 (got {spec!r})")
+        return major
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("java -version 2>&1")
+        if not out or "version" not in out:
+            return None
+        m = re.search(r'version "([^"]+)"', out)
+        path = ctx.probe("readlink -f \"$(command -v java)\"") or ""
+        method = self.method_of(ctx, "")
+        if not method:
+            method = ("sdkman" if ".sdkman" in path else "mise" if "mise" in path else
+                      "temurin-apt" if "temurin" in path else "apt" if path.startswith("/usr/lib/jvm") else "unknown")
+        return Detected(m.group(1) if m else first_version(out) or "?", method, path)
+
+    def _sdkman_id(self, ctx: Ctx, major: str) -> str:
+        """Newest Temurin identifier (e.g. 21.0.9-tem) for a major, from SDKMAN itself."""
+        text = ctx.probe('. "$HOME/.sdkman/bin/sdkman-init.sh" && PAGER=cat sdk list java') or ""
+        if "-tem" not in text:
+            platform_id = "linuxarm64" if arch()[0] == "arm64" else "linuxx64"
+            try:
+                text = http_text(f"https://api.sdkman.io/2/candidates/java/{platform_id}/versions/list?installed=")
+            except (urllib.error.URLError, OSError):
+                text = ""
+        ids = re.findall(rf"(?<![\d.])({re.escape(major)}(?:\.\d+)*(?:\+\d+)?-tem)\b", text)
+        if not ids:
+            raise ValueError(f"no Temurin {major} on SDKMAN")
+        return max(set(ids), key=vkey)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        major = self.resolve(ctx, spec, method)
+        if method == "sdkman":
+            if not (HOME / ".sdkman").exists():
+                ctx.apt.install("curl", "zip", "unzip", "ca-certificates")
+                ctx.sh('curl -fsSL --retry 3 --retry-delay 2 "https://get.sdkman.io?rcupdate=false" | bash')
+                # SDKMAN reads its settings from etc/config, not the environment: answer prompts with yes.
+                ctx.sh('sed -i "s/^sdkman_auto_answer=.*/sdkman_auto_answer=true/" "$HOME/.sdkman/etc/config"')
+                ctx.rc.add("sdkman", 'export SDKMAN_DIR="$HOME/.sdkman"',
+                           '[ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && . "$SDKMAN_DIR/bin/sdkman-init.sh"')
+            ident = major if "-" in major else (self._sdkman_id(ctx, major) if not ctx.dry_run else f"{major}-tem")
+            ctx.sh(f'. "$HOME/.sdkman/bin/sdkman-init.sh" && sdk install java {q(ident)} < /dev/null && sdk default java {q(ident)}')
+            version = ident
+        elif method == "mise":
+            mise_use(ctx, "java", f"temurin-{major}")
+            version = mise_has(ctx, "java") or major
+        else:
+            arch_dpkg, _ = arch()
+            ctx.apt.add_repo("adoptium", "https://packages.adoptium.net/artifactory/api/gpg/key/public",
+                             f"deb [arch={arch_dpkg} signed-by={{key}}] https://packages.adoptium.net/artifactory/deb "
+                             f"{ubuntu_codename()} main")
+            ctx.apt.install(f"temurin-{major}-jdk")
+            ctx.sh(f"update-java-alternatives -s temurin-{major}-jdk-{arch_dpkg} || true", sudo=True, check=False)
+            version = ctx.apt.version(f"temurin-{major}-jdk") or major
+            method = "temurin-apt"
+        ctx.state.set(self.id, method=method, version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "sdkman":
+            ctx.sh('rm -rf "$HOME/.sdkman"')
+            ctx.rc.remove("sdkman")
+        elif det.method == "mise":
+            mise_remove(ctx, "java")
+        elif det.method == "apt":
+            ctx.apt.purge("openjdk-*-jdk", "openjdk-*-jre", "default-jdk", "default-jre")
+        else:
+            ctx.apt.purge("temurin-*")
+            ctx.apt.remove_repo("adoptium")
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- Go
+
+class Go(Item):
+    id, name, section = "go", "Go", "lang"
+    default_method = "official"
+    managers = [("mise", "mise (polyglot)")]
+    has_lts = False
+    DL = "https://go.dev/dl/?mode=json"
+
+    def latest(self) -> str:
+        return strip_prefix(http_json(self.DL)[0]["version"], "go")  # type: ignore[index]
+
+    def resolve_specific(self, spec: str, method: str) -> str:
+        rel = http_json(self.DL + "&include=all")
+        versions = [strip_prefix(r["version"], "go") for r in rel if r.get("stable")]  # type: ignore[union-attr]
+        v = pick_version(versions, strip_prefix(spec, "go"))
+        if not v:
+            raise ValueError(f"no Go release matches {spec!r}")
+        return v
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("go version")
+        if not out:
+            return None
+        m = re.search(r"go(\d+\.\d+(?:\.\d+)?)", out)
+        path = ctx.probe("command -v go") or ""
+        method = self.method_of(ctx, "")
+        if not method:
+            method = ("official" if path.startswith("/usr/local/go") else "mise" if "mise" in path else
+                      "apt" if ctx.apt.installed("golang-go") else "unknown")
+        return Detected(m.group(1) if m else "?", method, path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        if method == "mise":
+            mise_use(ctx, "go", "latest" if spec in ("lts", "latest") else spec)
+            version = mise_has(ctx, "go") or spec
+        else:
+            version = self.resolve(ctx, spec, method)
+            garch, _ = arch()
+            ctx.apt.install("curl", "ca-certificates")
+            ctx.sh(f"rm -rf /usr/local/go && curl -fsSL --retry 3 --retry-delay 2 https://go.dev/dl/go{version}.linux-{garch}.tar.gz | tar -xz -C /usr/local",
+                   sudo=True)
+            ctx.rc.add("go", 'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"')
+            method = "official"
+        ctx.state.set(self.id, method=method, version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "mise":
+            mise_remove(ctx, "go")
+        elif det.method == "apt":
+            ctx.apt.purge("golang-go", "golang")
+        else:
+            ctx.sh("rm -rf /usr/local/go", sudo=True)
+            ctx.rc.remove("go")
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- Python
+
+class Python(Item):
+    id, name, section = "python", "Python", "lang"
+    default_method = "deadsnakes"
+    managers = [("uv", "uv (Astral; fast, manages Pythons + venvs)"), ("pyenv", "pyenv (builds from source)"),
+                ("mise", "mise (polyglot)")]
+    has_lts = False
+    EOL = "https://endoflife.date/api/python.json"
+    PYENV_DEPS = ("build-essential", "libssl-dev", "zlib1g-dev", "libbz2-dev", "libreadline-dev", "libsqlite3-dev",
+                  "curl", "git", "libncursesw5-dev", "xz-utils", "tk-dev", "libxml2-dev", "libxmlsec1-dev",
+                  "libffi-dev", "liblzma-dev")
+
+    def _cycles(self) -> list:
+        return http_json(self.EOL)  # type: ignore[return-value]
+
+    def latest(self) -> str:
+        return max((c["latest"] for c in self._cycles()), key=vkey)
+
+    def resolve_specific(self, spec: str, method: str) -> str:
+        spec = spec.strip()
+        if spec.count(".") >= 2:
+            return spec
+        for c in self._cycles():
+            if c["cycle"] == spec:
+                return c["latest"]
+        raise ValueError(f"no Python release matches {spec!r}")
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        st = ctx.state.get(self.id)
+        if st:
+            m = st["method"]
+            if m == "deadsnakes":
+                minor = ".".join(st["version"].split(".")[:2])
+                out = ctx.probe(f"python{minor} --version")
+                if out:
+                    return Detected(first_version(out) or st["version"], m, f"/usr/bin/python{minor}")
+            elif m == "uv":
+                out = ctx.probe(f'"$({LOCAL_BIN}/uv python find --managed-python 2>/dev/null)" --version')
+                if out:
+                    return Detected(first_version(out) or st["version"], m)
+            elif m == "pyenv":
+                out = ctx.probe('"$HOME/.pyenv/bin/pyenv" global')
+                if out:
+                    return Detected(out.split()[0], m, str(HOME / ".pyenv"))
+            elif m == "mise":
+                v = mise_has(ctx, "python")
+                if v:
+                    return Detected(v, m)
+        out = ctx.probe("python3 --version")
+        if out:
+            path = ctx.probe("command -v python3") or ""
+            if path.startswith("/usr/bin"):
+                return Detected(first_version(out) or "?", "system", path, managed=False)
+            method = "pyenv" if ".pyenv" in path else "mise" if "mise" in path else "uv" if "uv" in path else "unknown"
+            return Detected(first_version(out) or "?", method, path)
+        return None
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        if method == "uv":
+            if not (LOCAL_BIN / "uv").exists():
+                ctx.apt.install("curl", "ca-certificates")
+                ctx.sh("curl -LsSf --retry 3 --retry-delay 2 https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh")
+                ensure_local_bin_on_path(ctx)
+            target = "" if spec in ("lts", "latest") else spec
+            ctx.sh(f'"$HOME/.local/bin/uv" python install --default --preview {q(target) if target else ""}'.rstrip())
+            version = first_version(ctx.probe(f'"$({LOCAL_BIN}/uv python find)" --version')) or self.resolve(ctx, spec, method)
+        elif method == "pyenv":
+            version = self.resolve(ctx, spec, method)
+            ctx.apt.install(*self.PYENV_DEPS)
+            if not (HOME / ".pyenv").exists():
+                ctx.sh("curl -fsSL --retry 3 --retry-delay 2 https://pyenv.run | bash")
+                ctx.rc.add("pyenv", 'export PYENV_ROOT="$HOME/.pyenv"', 'export PATH="$PYENV_ROOT/bin:$PATH"',
+                           'eval "$(pyenv init - $(basename "$SHELL"))"')
+            ctx.sh(f'"$HOME/.pyenv/bin/pyenv" install --skip-existing {q(version)} && "$HOME/.pyenv/bin/pyenv" global {q(version)}')
+        elif method == "mise":
+            mise_use(ctx, "python", "latest" if spec in ("lts", "latest") else spec)
+            version = mise_has(ctx, "python") or spec
+        else:
+            version = self.resolve(ctx, spec, method)
+            minor = ".".join(version.split(".")[:2])
+            ctx.apt.install("software-properties-common")
+            if not ctx.apt.candidates(f"python{minor}") or not ctx.probe(f"apt-cache policy python{minor} | grep -q deadsnakes && echo y"):
+                ctx.sh("for i in 1 2 3; do add-apt-repository -y ppa:deadsnakes/ppa && exit 0; "
+                       "echo 'Launchpad request failed; retrying in 10s'; sleep 10; done; exit 1", sudo=True)
+                ctx.apt.update(force=True)
+            ctx.apt.install(f"python{minor}", f"python{minor}-venv", f"python{minor}-dev")
+            version = first_version(ctx.probe(f"python{minor} --version")) or version
+            method = "deadsnakes"
+            ctx.ui.info(f"run it as python{minor} (Ubuntu's own python3 is left alone; the OS depends on it)")
+        ctx.state.set(self.id, method=method, version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if not det.managed:
+            ctx.ui.warn("skipping Ubuntu's system python3: the OS depends on it")
+            return
+        st = ctx.state.get(self.id) or {}
+        if det.method == "uv":
+            ctx.sh(f'"{LOCAL_BIN}/uv" python uninstall --all || true; rm -f "{LOCAL_BIN}/uv" "{LOCAL_BIN}/uvx"; '
+                   'rm -rf "$HOME/.local/share/uv"', check=False)
+        elif det.method == "pyenv":
+            ctx.sh('rm -rf "$HOME/.pyenv"')
+            ctx.rc.remove("pyenv")
+        elif det.method == "mise":
+            mise_remove(ctx, "python")
+        elif det.method == "deadsnakes":
+            minor = ".".join(st.get("version", det.version).split(".")[:2])
+            ctx.apt.purge(f"python{minor}", f"python{minor}-venv", f"python{minor}-dev")
+            ctx.sh("add-apt-repository -y --remove ppa:deadsnakes/ppa || true", sudo=True, check=False)
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- Rust
+
+class Rust(Item):
+    id, name, section = "rust", "Rust", "lang"
+    default_method = "rustup"
+    managers = [("mise", "mise (polyglot; rustup is used by default and is Rust's official manager)")]
+    has_lts = False
+
+    def latest(self) -> str:
+        return "stable"
+
+    def version_hint(self) -> str:
+        return "Rust has no LTS: Enter installs the current stable toolchain"
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("rustc --version")
+        if not out:
+            return None
+        path = ctx.probe("command -v rustc") or ""
+        method = self.method_of(ctx, "")
+        if not method:
+            method = ("rustup" if ".cargo" in path or ".rustup" in path else "mise" if "mise" in path else
+                      "apt" if ctx.apt.installed("rustc") else "unknown")
+        return Detected(first_version(out) or "?", method, path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        toolchain = "stable" if spec in ("lts", "latest") else spec.lstrip("vV")
+        ctx.apt.install("build-essential", "curl", "ca-certificates", "pkg-config")
+        if method == "mise":
+            mise_use(ctx, "rust", toolchain)
+        else:
+            if not (HOME / ".cargo" / "bin" / "rustup").exists():
+                ctx.sh(f"curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 2 https://sh.rustup.rs | sh -s -- -y --no-modify-path "
+                       f"--default-toolchain {q(toolchain)} --profile default")
+                ctx.rc.add("rust", '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"')
+            else:
+                ctx.sh(f'"$HOME/.cargo/bin/rustup" update {q(toolchain)} || "$HOME/.cargo/bin/rustup" toolchain install {q(toolchain)}')
+                ctx.sh(f'"$HOME/.cargo/bin/rustup" default {q(toolchain)}')
+            method = "rustup"
+        version = first_version(ctx.probe('"$HOME/.cargo/bin/rustc" --version || rustc --version')) or toolchain
+        ctx.state.set(self.id, method=method, version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "mise":
+            mise_remove(ctx, "rust")
+        elif det.method == "apt":
+            ctx.apt.purge("rustc", "cargo")
+        else:
+            ctx.sh('"$HOME/.cargo/bin/rustup" self uninstall -y || rm -rf "$HOME/.cargo" "$HOME/.rustup"', check=False)
+            ctx.rc.remove("rust")
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- containers
+
+class AptEngine(Item):
+    """Container engines installed from apt; versions come from `apt-cache madison`."""
+    section = "containers"
+    has_lts = False
+    packages: Tuple[str, ...] = ()
+    main_pkg = ""
+
+    def latest(self) -> str:
+        return "latest"
+
+    def version_hint(self) -> str:
+        return "no LTS: Enter installs the newest packaged version"
+
+    def apt_spec(self, ctx: Ctx, spec: str) -> str:
+        """`pkg` for latest, or `pkg=<full apt version>` for a requested version."""
+        if spec in ("lts", "latest"):
+            return ""
+        cands = ctx.apt.candidates(self.main_pkg)
+        for c in cands:
+            bare = c.split(":", 1)[-1]
+            if bare.startswith(spec) or c.startswith(spec):
+                return c
+        if ctx.dry_run:
+            return spec
+        raise CommandError(f"{self.main_pkg} {spec} isn't available (try: apt-cache madison {self.main_pkg})")
+
+    def detect_cmd(self) -> str:
+        raise NotImplementedError
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe(self.detect_cmd())
+        if not out:
+            return None
+        return Detected(first_version(out) or "?", self.method_of(ctx, "apt"), ctx.probe(f"command -v {self.id}") or "")
+
+    def post_install(self, ctx: Ctx) -> None:
+        pass
+
+    def start_service(self, ctx: Ctx, svc: str) -> None:
+        if has_systemd():
+            ctx.sh(f"systemctl enable --now {svc}", sudo=True, check=False)
+        else:
+            ctx.sh(f"service {svc} start || true", sudo=True, check=False)
+            if is_wsl():
+                ctx.ui.warn("WSL without systemd: start it with `sudo service " + svc + " start`, or enable systemd "
+                            "in /etc/wsl.conf ([boot] systemd=true) and run `wsl --shutdown`")
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        pinned = self.apt_spec(ctx, spec)
+        pkgs = [f"{p}={pinned}" if pinned and p == self.main_pkg else p for p in self.packages]
+        self.add_repo(ctx)
+        ctx.apt.install(*pkgs)
+        self.post_install(ctx)
+        version = ctx.apt.version(self.main_pkg) or spec
+        ctx.state.set(self.id, method="apt", version=version)
+        return version
+
+    def add_repo(self, ctx: Ctx) -> None:
+        pass
+
+
+class Docker(AptEngine):
+    id, name = "docker", "Docker Engine (+ Compose & Buildx)"
+    main_pkg = "docker-ce"
+    packages = ("docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin")
+    CONFLICTS = ("docker.io", "docker-doc", "docker-compose", "docker-compose-v2", "podman-docker", "containerd", "runc")
+
+    def detect_cmd(self) -> str:
+        return "docker --version"
+
+    def add_repo(self, ctx: Ctx) -> None:
+        ctx.apt.purge(*self.CONFLICTS)
+        a, _ = arch()
+        ctx.apt.add_repo("docker", "https://download.docker.com/linux/ubuntu/gpg",
+                         f"deb [arch={a} signed-by={{key}}] https://download.docker.com/linux/ubuntu {ubuntu_codename()} stable")
+
+    def post_install(self, ctx: Ctx) -> None:
+        user = target_user()
+        if user != "root":
+            ctx.sh(f"usermod -aG docker {q(user)}", sudo=True, check=False)
+            ctx.ui.info(f"added {user} to the docker group (log out and back in, or run `newgrp docker`)")
+        self.start_service(ctx, "docker")
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        ctx.apt.purge(*self.packages, "docker-ce-rootless-extras", "docker.io")
+        ctx.apt.remove_repo("docker")
+        ctx.ui.info("images, containers and volumes in /var/lib/docker were kept (delete it to reclaim space)")
+        ctx.state.drop(self.id)
+
+
+class Podman(AptEngine):
+    id, name = "podman", "Podman (daemonless, rootless)"
+    main_pkg = "podman"
+    packages = ("podman", "uidmap", "slirp4netns", "fuse-overlayfs")
+
+    def detect_cmd(self) -> str:
+        return "podman --version"
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        ctx.apt.purge("podman", "podman-docker", "podman-compose")
+        ctx.state.drop(self.id)
+
+
+class Containerd(AptEngine):
+    id, name = "containerd", "containerd (+ nerdctl CLI)"
+    main_pkg = "containerd"
+    packages = ("containerd", "runc")
+
+    def detect_cmd(self) -> str:
+        return "containerd --version"
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        # Docker ships its own containerd (package containerd.io); that copy belongs to Docker.
+        if not ctx.state.get(self.id) and not ctx.apt.installed("containerd"):
+            return None
+        return super().detect(ctx)
+
+    def post_install(self, ctx: Ctx) -> None:
+        a, _ = arch()
+        try:
+            tag = http_json("https://api.github.com/repos/containerd/nerdctl/releases/latest")["tag_name"]  # type: ignore[index]
+        except Exception:  # noqa: BLE001
+            tag = "v2.0.3"
+        ver = str(tag).lstrip("v")
+        ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://github.com/containerd/nerdctl/releases/download/v{ver}/nerdctl-{ver}-linux-{a}.tar.gz "
+               f"| tar -xz -C /usr/local/bin nerdctl", sudo=True)
+        self.start_service(ctx, "containerd")
+        ctx.ui.info("use `sudo nerdctl run …` (docker-compatible CLI)")
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        ctx.apt.purge("containerd")
+        ctx.sh("rm -f /usr/local/bin/nerdctl", sudo=True, check=False)
+        ctx.state.drop(self.id)
+
+
+# ----------------------------------------------------------------------------- AI CLIs
+
+class NpmCli(Item):
+    """An AI CLI distributed on npm, installed into ~/.local with Node.js."""
+    section = "ai"
+    has_lts = False
+    package = ""
+    binary = ""
+    min_node = 20
+
+    def latest(self) -> str:
+        data = http_json(f"https://registry.npmjs.org/{self.package}")
+        return data["dist-tags"]["latest"]  # type: ignore[index]
+
+    def version_hint(self) -> str:
+        try:
+            return f"latest={self.latest()} (no LTS: Enter installs the latest stable release)"
+        except Exception:  # noqa: BLE001
+            return "no LTS: Enter installs the latest stable release"
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe(f"{self.binary} --version 2>&1")
+        if not out:
+            return None
+        path = ctx.probe(f"command -v {self.binary}") or ""
+        return Detected(first_version(out) or "?", self.method_of(ctx, "npm"), path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        ensure_node_for_npm(ctx, self.min_node)
+        tag = "latest" if spec in ("lts", "latest") else spec.lstrip("vV")
+        npm_global(ctx, f"install {q(f'{self.package}@{tag}')}")
+        ensure_local_bin_on_path(ctx)
+        version = first_version(ctx.probe(f"{LOCAL_BIN}/{self.binary} --version 2>&1")) or tag
+        ctx.state.set(self.id, method="npm", version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "npm" or not det.path or str(NPM_PREFIX) in det.path:
+            npm_global(ctx, f"uninstall {q(self.package)}")
+        else:
+            ctx.sh(f"npm uninstall -g {q(self.package)} || true", check=False)
+        ctx.state.drop(self.id)
+
+
+class ClaudeCode(Item):
+    id, name, section = "claude", "Claude Code (Anthropic)", "ai"
+    has_lts = True
+
+    def lts(self) -> str:
+        return "stable"
+
+    def latest(self) -> str:
+        return "latest"
+
+    def version_hint(self) -> str:
+        return "Enter = 'stable' channel (Claude Code's LTS-like channel), latest = newest release"
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("claude --version 2>&1")
+        if not out:
+            return None
+        path = ctx.probe("command -v claude") or ""
+        method = self.method_of(ctx, "npm" if "node_modules" in (ctx.probe(f"readlink -f {q(path)}") or "") else "native")
+        return Detected(first_version(out) or "?", method, path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        arg = {"lts": "stable", "latest": "latest"}.get(spec, spec.lstrip("vV"))
+        ctx.apt.install("curl", "ca-certificates")
+        ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://claude.ai/install.sh | bash -s {q(arg)}")
+        ensure_local_bin_on_path(ctx)
+        version = first_version(ctx.probe(f"{LOCAL_BIN}/claude --version 2>&1")) or arg
+        ctx.state.set(self.id, method="native", version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "npm":
+            ctx.sh("npm uninstall -g @anthropic-ai/claude-code || true", check=False)
+        ctx.sh('rm -f "$HOME/.local/bin/claude" && rm -rf "$HOME/.local/share/claude"', check=False)
+        ctx.ui.info("kept your settings in ~/.claude and ~/.claude.json (delete them for a clean slate)")
+        ctx.state.drop(self.id)
+
+
+class Codex(NpmCli):
+    id, name = "codex", "OpenAI Codex CLI"
+    package, binary = "@openai/codex", "codex"
+
+
+class Gemini(NpmCli):
+    id, name = "gemini", "Google Gemini CLI"
+    package, binary = "@google/gemini-cli", "gemini"
+
+
+class Copilot(Item):
+    id, name, section = "copilot", "GitHub Copilot CLI", "ai"
+    has_lts = False
+
+    def latest(self) -> str:
+        return "latest"
+
+    def version_hint(self) -> str:
+        return "no LTS: Enter installs the latest release (or type e.g. 0.0.369)"
+
+    def detect(self, ctx: Ctx) -> Optional[Detected]:
+        out = ctx.probe("copilot --version 2>&1")
+        if not out:
+            return None
+        path = ctx.probe("command -v copilot") or ""
+        method = self.method_of(ctx, "npm" if "node_modules" in (ctx.probe(f"readlink -f {q(path)}") or "") else "script")
+        return Detected(first_version(out) or "?", method, path)
+
+    def install(self, ctx: Ctx, spec: str, method: str) -> str:
+        ctx.apt.install("curl", "ca-certificates")
+        env = 'PREFIX="$HOME/.local"' + ("" if spec in ("lts", "latest") else f" VERSION={q('v' + spec.lstrip('vV'))}")
+        ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://gh.io/copilot-install | {env} bash")
+        ensure_local_bin_on_path(ctx)
+        version = first_version(ctx.probe(f"{LOCAL_BIN}/copilot --version 2>&1")) or spec
+        ctx.state.set(self.id, method="script", version=version)
+        return version
+
+    def uninstall(self, ctx: Ctx, det: Detected) -> None:
+        if det.method == "npm":
+            npm_global(ctx, "uninstall @github/copilot")
+        ctx.sh('rm -f "$HOME/.local/bin/copilot"', check=False)
+        ctx.state.drop(self.id)
+
+
+ITEMS: Dict[str, Item] = {i.id: i for i in [
+    Node(), DotNet(), Java(), Go(), Python(), Rust(),
+    Docker(), Podman(), Containerd(),
+    ClaudeCode(), Codex(), Copilot(), Gemini(),
+]}
+
+
+def items_in(section: str) -> List[Item]:
+    return [i for i in ITEMS.values() if i.section == section]
+
+
+# =============================================================================
+# Interactive prompts
+# =============================================================================
+
+class Prompt:
+    def __init__(self, ui: UI, assume_yes: bool = False):
+        self.ui = ui
+        self.yes = assume_yes
+        self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
+    def line(self, text: str, default: str = "") -> str:
+        if self.yes:
+            self.ui.say(f"{text}{self.ui.dim(default or '<Enter>')}  (-y)")
+            return default
+        try:
+            ans = input(text)
+        except EOFError:
+            ans = ""
+        return ans.strip() or default
+
+    def confirm(self, text: str, default: bool = True) -> bool:
+        hint = "[Y/n]" if default else "[y/N]"
+        ans = self.line(f"{text} {hint} ", "y" if default else "n").lower()
+        return ans in ("y", "yes")
+
+    def checklist(self, title: str, options: List[Tuple[str, str]], defaults: Sequence[str] = (),
+                  radio: bool = False, default_if_yes: Sequence[str] = ()) -> List[str]:
+        """Multi-select (or single-select when radio=True). Returns selected keys."""
+        if self.yes:
+            chosen = list(default_if_yes)
+            labels = ", ".join(lbl for k, lbl in options if k in chosen) or "none"
+            self.ui.say(f"{self.ui.bold(title)}: {labels}  (-y)")
+            return chosen
+        if self.interactive:
+            try:
+                return self._checklist_tty(title, options, list(defaults), radio)
+            except (OSError, ImportError):
+                pass
+        return self._checklist_plain(title, options, list(defaults), radio)
+
+    def _checklist_plain(self, title: str, options: List[Tuple[str, str]], selected: List[str], radio: bool) -> List[str]:
+        self.ui.say(self.ui.bold(title))
+        for n, (_k, lbl) in enumerate(options, 1):
+            self.ui.say(f"  {n}) {lbl}")
+        kind = "one number" if radio else "numbers separated by spaces/commas, 'all'"
+        ans = self.line(f"Choose {kind} (Enter = {'skip' if not selected else 'defaults'}): ", "")
+        if not ans:
+            return selected[:1] if radio else selected
+        if ans.lower() == "all" and not radio:
+            return [k for k, _ in options]
+        picks = []
+        for tok in re.split(r"[,\s]+", ans):
+            if tok.isdigit() and 1 <= int(tok) <= len(options):
+                picks.append(options[int(tok) - 1][0])
+        return picks[:1] if radio else list(dict.fromkeys(picks))
+
+    def _checklist_tty(self, title: str, options: List[Tuple[str, str]], selected: List[str], radio: bool) -> List[str]:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        chosen = set(selected[:1] if radio else selected)
+        cursor = 0
+        help_text = ("↑/↓ move · space select (one) · Enter confirm · Enter on nothing = skip" if radio else
+                     "↑/↓ move · space toggle · a all/none · Enter confirm")
+        mark_on, mark_off = ("(•)", "( )") if radio else ("[x]", "[ ]")
+        lines_drawn = 0
+
+        def draw() -> None:
+            nonlocal lines_drawn
+            out = []
+            if lines_drawn:
+                out.append(f"\033[{lines_drawn}F")
+            out.append(f"\033[J{self.ui.bold(title)}  {self.ui.dim(help_text)}\r\n")
+            for i, (k, lbl) in enumerate(options):
+                arrow = self.ui.cyan("›") if i == cursor else " "
+                mark = self.ui.green(mark_on) if k in chosen else mark_off
+                out.append(f" {arrow} {mark} {lbl}\r\n")
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            lines_drawn = len(options) + 1
+
+        def read_key() -> str:
+            ch = os.read(fd, 1)
+            if ch == b"\x1b":
+                seq = os.read(fd, 2)
+                return {b"[A": "up", b"[B": "down"}.get(seq, "")
+            return {b" ": "space", b"\r": "enter", b"\n": "enter", b"\x03": "ctrl-c", b"k": "up", b"j": "down",
+                    b"a": "all", b"x": "space", b"q": "ctrl-c"}.get(ch, ch.decode(errors="ignore"))
+
+        try:
+            tty.setraw(fd)
+            sys.stdout.write("\033[?25l")
+            draw()
+            while True:
+                key = read_key()
+                if key == "up":
+                    cursor = (cursor - 1) % len(options)
+                elif key == "down":
+                    cursor = (cursor + 1) % len(options)
+                elif key == "space":
+                    k = options[cursor][0]
+                    if radio:
+                        chosen = set() if k in chosen else {k}
+                    else:
+                        chosen.symmetric_difference_update({k})
+                elif key == "all" and not radio:
+                    chosen = set() if len(chosen) == len(options) else {k for k, _ in options}
+                elif key.isdigit() and 1 <= int(key) <= len(options):
+                    cursor = int(key) - 1
+                    k = options[cursor][0]
+                    if radio:
+                        chosen = set() if k in chosen else {k}
+                    else:
+                        chosen.symmetric_difference_update({k})
+                elif key == "enter":
+                    break
+                elif key == "ctrl-c":
+                    raise KeyboardInterrupt
+                draw()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        result = [k for k, _ in options if k in chosen]
+        self.ui.to_file(f"{title}: {result}")
+        return result
+
+
+# =============================================================================
+# Planning
+# =============================================================================
+
+@dataclass
+class Action:
+    item: Item
+    kind: str                # "install" | "update" | "remove"
+    spec: str = ""           # "lts" | "latest" | explicit version
+    method: str = ""         # install method / version manager
+    detected: Optional[Detected] = None
+
+    def label(self) -> str:
+        if self.kind == "remove":
+            return f"remove {self.item.name}"
+        how = "" if self.method == self.item.default_method else f" via {self.method}"
+        what = {"lts": "LTS" if self.item.has_lts else "latest", "latest": "latest"}.get(self.spec, self.spec)
+        return f"{self.kind} {self.item.name} {what}{how}"
+
+
+@dataclass
+class Plan:
+    actions: List[Action] = field(default_factory=list)
+
+
+VERSION_RE = re.compile(r"^[vV]?\d+(\.\d+){0,3}([-+][0-9A-Za-z.]+)?$")
+
+
+def parse_version_answer(ans: str) -> Optional[str]:
+    """'' / y / Y → 'lts'; 'latest' → 'latest'; n → None (skip); anything else → that version."""
+    a = ans.strip()
+    if a.lower() in ("", "y", "yes", "lts"):
+        return "lts"
+    if a.lower() in ("n", "no", "skip"):
+        return None
+    if a.lower() in ("latest", "l"):
+        return "latest"
+    return a
+
+
+def ask_item(prompt: Prompt, ctx: Ctx, item: Item, ask_manager: bool) -> Optional[Action]:
+    ui = ctx.ui
+    det = item.detect(ctx)
+    ui.say()
+    ui.say(ui.bold(f"── {item.name} ") + ui.dim("─" * max(2, 40 - len(item.name))))
+    kind = "install"
+    if det:
+        where = f" ({det.method}{', ' + det.path if det.path else ''})"
+        ui.say(f"  installed: {ui.green(det.version)}{ui.dim(where)}")
+        if not det.managed:
+            ui.say(ui.dim("  this is the OS's own copy; config-me can install another version alongside it"))
+        choices = "[U]pdate / [r]emove / [k]eep" if det.managed else "[U]pdate (install alongside) / [k]eep"
+        valid = ("u", "update", "y", "r", "remove", "k", "keep", "n") if det.managed else ("u", "update", "y", "k", "keep", "n")
+        while True:
+            ans = prompt.line(f"  {choices}: ", "u").lower()
+            if ans in valid:
+                break
+            ui.say(ui.yellow("  answer u (update), " + ("r (remove), " if det.managed else "") + "or k (keep)"))
+        if ans in ("k", "keep", "n"):
+            return None
+        if ans in ("r", "remove"):
+            return Action(item, "remove", detected=det)
+        kind = "update"
+    hint = item.version_hint()
+    ui.say(ui.dim(f"  {hint}") if hint else "")
+    lts_word = "LTS" if item.has_lts else "latest"
+    while True:
+        ans = prompt.line(f"  Version? [Enter/y = {lts_word}, 'latest', a version like 22 or 22.11.0, n = skip]: ", "y")
+        spec = parse_version_answer(ans)
+        if spec is None:
+            return None
+        if spec in ("lts", "latest") or VERSION_RE.match(spec):
+            break
+        ui.say(ui.yellow(f"  {ans!r} doesn't look like a version (e.g. 22, 3.12, 1.24.3, 21.0.5-tem)"))
+    method = item.default_method
+    if ask_manager and item.managers:
+        names = " / ".join(k for k, _ in item.managers)
+        for k, desc in item.managers:
+            ui.say(ui.dim(f"    {k:<6} {desc}"))
+        default_desc = {"official": "official release build", "dotnet-install": "Microsoft's dotnet-install script",
+                        "temurin-apt": "Adoptium Temurin apt repo", "deadsnakes": "deadsnakes apt packages",
+                        "rustup": "rustup"}.get(item.default_method, item.default_method)
+        while True:
+            ans = prompt.line(f"  Use a version manager? [{names}, Enter/n = no ({default_desc})]: ", "n").lower()
+            if ans in ("", "n", "no", "none"):
+                break
+            if ans in {k for k, _ in item.managers}:
+                method = ans
+                break
+            ui.say(ui.yellow(f"  pick one of: {names}, or n"))
+    return Action(item, kind, spec, method, det)
+
+
+def interactive_plan(prompt: Prompt, ctx: Ctx, assume_yes: bool) -> Plan:
+    plan = Plan()
+    ui = ctx.ui
+
+    # 1. Languages
+    langs = items_in("lang")
+    picked = prompt.checklist("1) Programming languages", [(i.id, i.name) for i in langs],
+                              defaults=(), default_if_yes=[i.id for i in langs])
+    for item_id in picked:
+        act = ask_item(prompt, ctx, ITEMS[item_id], ask_manager=True)
+        if act:
+            plan.actions.append(act)
+
+    # 2. Container engine (one at most)
+    engines = items_in("containers")
+    ui.say()
+    picked = prompt.checklist("2) Container engine (pick one, or none)", [(i.id, i.name) for i in engines],
+                              radio=True, default_if_yes=["docker"])
+    if picked:
+        others = [e for e in engines if e.id != picked[0] and e.detect(ctx)]
+        if others:
+            ui.say(ui.yellow(f"  note: {', '.join(e.name for e in others)} is also installed; "
+                             f"remove it with `config-me -rm {others[0].id}` if they conflict"))
+        act = ask_item(prompt, ctx, ITEMS[picked[0]], ask_manager=False)
+        if act:
+            plan.actions.append(act)
+
+    # 3. AI CLIs
+    ais = items_in("ai")
+    ui.say()
+    picked = prompt.checklist("3) AI CLI tools", [(i.id, i.name) for i in ais], default_if_yes=[i.id for i in ais])
+    for item_id in picked:
+        act = ask_item(prompt, ctx, ITEMS[item_id], ask_manager=False)
+        if act:
+            plan.actions.append(act)
+    return plan
+
+
+def blang_plan(ctx: Ctx) -> Plan:
+    plan = Plan()
+    for item in items_in("lang"):
+        det = item.detect(ctx)
+        plan.actions.append(Action(item, "update" if det else "install", "lts", item.default_method, det))
+    return plan
+
+
+def resolve_targets(names: Sequence[str]) -> List[Item]:
+    if not names or any(n.lower() in ("all", "everything") for n in names):
+        return list(ITEMS.values())
+    out: List[Item] = []
+    for n in names:
+        key = n.lower().strip()
+        if key in SECTION_ALIASES:
+            out += items_in(SECTION_ALIASES[key])
+        elif key in ITEMS:
+            out.append(ITEMS[key])
+        elif key in ("c#", "csharp", "net", ".net"):
+            out.append(ITEMS["dotnet"])
+        else:
+            valid = ", ".join(sorted(set(SECTION_ALIASES) | set(ITEMS)))
+            raise SystemExit(f"config-me: unknown section or tool {n!r} (valid: {valid})")
+    return list(dict.fromkeys(out))
+
+
+# =============================================================================
+# Execution
+# =============================================================================
+
+def execute(ctx: Ctx, plan: Plan) -> int:
+    ui = ctx.ui
+    if not plan.actions:
+        ui.say("Nothing to do.")
+        return 0
+    total = len(plan.actions)
+    failures: List[Tuple[Action, str]] = []
+    results: List[str] = []
+    started = time.time()
+    if not ctx.run.is_root and not ctx.dry_run:
+        ctx.run.ensure_sudo()
+    ui.bar(0, total, "starting…")
+    for n, act in enumerate(plan.actions, 1):
+        ui.bar(n - 1, total, act.label())
+        ui.step(f"[{n}/{total}] {act.label()}")
+        try:
+            if act.kind == "remove":
+                det = act.detected or act.item.detect(ctx)
+                if det:
+                    act.item.uninstall(ctx, det)
+                results.append(f"{ui.green('✓')} removed {act.item.name}")
+            else:
+                if act.kind == "update" and act.detected and act.detected.managed and act.detected.method not in (
+                        act.method, "unknown", "system") and act.item.section == "lang":
+                    ui.warn(f"{act.item.name} is currently installed via {act.detected.method}; installing via "
+                            f"{act.method} too. Whichever comes first on PATH wins (remove the old one with -rm).")
+                version = act.item.install(ctx, act.spec, act.method)
+                results.append(f"{ui.green('✓')} {act.item.name} {version} ({act.method or 'default'})")
+                ui.ok(f"{act.item.name} {version}")
+        except Exception as e:  # noqa: BLE001 - one failed item must not stop the rest
+            msg = (str(e) or type(e).__name__).splitlines()[0]
+            failures.append((act, str(e)))
+            results.append(f"{ui.red('✗')} {act.label()}: {msg}")
+            ui.error(str(e))
+        except KeyboardInterrupt:
+            ui.end_bar()
+            ui.say(ui.yellow("\ninterrupted"))
+            return 130
+        ui.bar(n, total, act.label())
+    ui.end_bar()
+    ui.say()
+    ui.say(ui.bold(f"Summary ({time.time() - started:.0f}s)"))
+    for r in results:
+        ui.say("  " + r)
+    if not ctx.dry_run:
+        ui.say(ui.dim(f"  full log: {LOG_FILE}"))
+        if any(a.kind != "remove" for a in plan.actions):
+            ui.say(ui.dim("  open a new terminal (or `exec $SHELL -l`) so PATH changes take effect"))
+    return 1 if failures else 0
+
+
+def cmd_stat(ctx: Ctx) -> int:
+    ui = ctx.ui
+    ui.say(ui.bold(f"config-me {VERSION}") + ui.dim(f"  (state: {STATE_FILE})"))
+    for sec, title in SECTIONS.items():
+        ui.say()
+        ui.say(ui.bold(title))
+        for item in items_in(sec):
+            det = item.detect(ctx)
+            if det:
+                extra = det.method + ("" if det.managed else ", not managed")
+                ui.say(f"  {ui.green('●')} {item.name:<36} {det.version:<22} {ui.dim(extra)}")
+            else:
+                ui.say(f"  {ui.dim('○')} {item.name:<36} {ui.dim('not installed')}")
+    ui.say()
+    ui.say(ui.bold("Version managers"))
+    for name, check in (("mise", f"{mise_bin()} --version"), ("nvm", '. "$HOME/.nvm/nvm.sh" && nvm --version'),
+                        ("fnm", '"$HOME/.local/share/fnm/fnm" --version'), ("SDKMAN!", '. "$HOME/.sdkman/bin/sdkman-init.sh" && sdk version'),
+                        ("pyenv", '"$HOME/.pyenv/bin/pyenv" --version'), ("uv", f'"{LOCAL_BIN}/uv" --version'),
+                        ("rustup", '"$HOME/.cargo/bin/rustup" --version 2>/dev/null')):
+        v = first_version(ctx.probe(check))
+        ui.say(f"  {ui.green('●') if v else ui.dim('○')} {name:<36} {v or ui.dim('not installed')}")
+    return 0
+
+
+def cmd_rm(ctx: Ctx, prompt: Prompt, names: Sequence[str]) -> int:
+    ui = ctx.ui
+    targets = resolve_targets(names)
+    found = [(i, d) for i in targets for d in [i.detect(ctx)] if d]
+    removable = [(i, d) for i, d in found if d.managed]
+    for i, d in found:
+        if not d.managed:
+            ui.say(ui.dim(f"skipping {i.name} {d.version}: it's the OS's own copy"))
+    if not removable:
+        ui.say("Nothing installed to remove.")
+        return 0
+    ui.say(ui.bold("Will uninstall:"))
+    for i, d in removable:
+        ui.say(f"  - {i.name} {d.version} ({d.method})")
+    if not prompt.confirm("Proceed?", default=False):
+        ui.say("Aborted.")
+        return 1
+    plan = Plan([Action(i, "remove", detected=d) for i, d in removable])
+    code = execute(ctx, plan)
+    full = not names or any(n.lower() in ("all", "everything") for n in names)
+    if full and ctx.state.get("_mise") and not ctx.dry_run:
+        ctx.sh(f"{mise_bin()} implode --yes || rm -f {MISE}", check=False)
+        ctx.rc.remove("mise")
+        ctx.state.drop("_mise")
+    if full:
+        ctx.rc.remove("local-bin")
+    return code
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="config-me",
+        description="Configure a fresh Ubuntu VM / WSL distro: languages, a container engine and AI CLI tools.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+        epilog="""sections for -rm: lang, containers (alias: images), ai, or tool ids:
+  node dotnet java go python rust docker podman containerd claude codex copilot gemini
+
+examples:
+  config-me                 interactive setup
+  config-me -y              accept every default (all languages LTS, Docker, all AI CLIs)
+  config-me -blang          just the LTS of every language, no questions
+  config-me -stat           what's installed, by section
+  config-me -rm ai          uninstall every AI CLI
+  config-me -rm             uninstall everything config-me manages
+  config-me -mute -blang    progress bar instead of logs
+""",
+    )
+    p.add_argument("-y", "--yes", action="store_true", help="agree to everything (use every default, no questions)")
+    p.add_argument("-blang", "--blang", action="store_true",
+                   help="install the latest LTS of every language (latest where there's no LTS), nothing else")
+    p.add_argument("-rm", "--rm", nargs="*", metavar="SECTION", default=None,
+                   help="uninstall everything config-me manages, or only the given sections/tools")
+    p.add_argument("-stat", "--stat", action="store_true", help="list managed software by section with installed versions")
+    p.add_argument("-mute", "--mute", action="store_true", help="no logs; show a progress bar (full log goes to the log file)")
+    p.add_argument("--dry-run", action="store_true", help="print what would run without changing anything")
+    p.add_argument("--version", action="version", version=f"config-me {VERSION}")
+    return p
+
+
+def check_platform(ui: UI) -> None:
+    if sys.platform != "linux" or not shutil.which("apt-get"):
+        raise SystemExit("config-me: this script targets Ubuntu (Linux with apt)")
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        ui.warn(f"running under sudo: user-level tools would go to {HOME}, not ~{os.environ['SUDO_USER']}. "
+                "Run config-me as your normal user; it calls sudo itself when needed.")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    ui = UI(mute=args.mute)
+    ui.open_log()
+    check_platform(ui)
+    run = Runner(ui, dry_run=args.dry_run)
+    ctx = Ctx(ui=ui, run=run, apt=Apt(run), rc=ShellRc(ui, args.dry_run), state=State(args.dry_run), dry_run=args.dry_run)
+    prompt = Prompt(ui, assume_yes=args.yes or args.blang)
+    if args.dry_run:
+        ui.say(ui.yellow("dry run: nothing will be changed"))
+    try:
+        if args.stat:
+            return cmd_stat(ctx)
+        if args.rm is not None:
+            return cmd_rm(ctx, prompt, args.rm)
+        if args.blang:
+            plan = blang_plan(ctx)
+        else:
+            ui.say(ui.bold("config-me") + ui.dim(f" {VERSION}: set up this {'WSL distro' if is_wsl() else 'machine'}"))
+            plan = interactive_plan(prompt, ctx, args.yes)
+        if not plan.actions:
+            ui.say("\nNothing selected. Bye!")
+            return 0
+        ui.say()
+        ui.say(ui.bold("Plan:"))
+        for a in plan.actions:
+            ui.say(f"  - {a.label()}")
+        if not args.yes and not args.blang and not prompt.confirm("Go ahead?", default=True):
+            ui.say("Aborted.")
+            return 1
+        return execute(ctx, plan)
+    except KeyboardInterrupt:
+        ui.end_bar()
+        ui.say(ui.yellow("\ninterrupted"))
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
