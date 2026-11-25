@@ -12,8 +12,10 @@ Run `config-me -h` for flags. Standard library only; needs Python 3.8+ and Ubunt
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as _dt
 import getpass
+import itertools
 import json
 import os
 import platform
@@ -28,7 +30,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 VERSION = "1.0.0"
 HOME = Path.home()
@@ -107,6 +109,20 @@ class UI:
     def warn(self, msg: str) -> None: self._emit(self.yellow("  ! ") + msg, f"  WARN {msg}", force=True)
     def error(self, msg: str) -> None: self._emit(self.red("  ✗ ") + msg, f"  ERROR {msg}", force=True)
     def cmd(self, msg: str) -> None: self._emit(self.dim("  $ " + msg), f"  $ {msg}")
+
+    def waiting(self, msg: str) -> None:
+        """A 'still working' notice: shown as a log line, or in the progress bar label with -mute."""
+        self.to_file(f"  ... {msg}")
+        if self.mute:
+            with self._lock:
+                if self._bar:
+                    done, total, label = self._bar
+                    base = label.split("  ·  ")[0]
+                    self._bar = (done, total, f"{base}  ·  {msg}")
+                    self._draw_bar()
+            return
+        with self._lock:
+            print(self.yellow("  … ") + self.dim(msg), flush=True)
     def out(self, msg: str) -> None: self._emit(self.dim("  │ " + msg), f"  | {msg}")
 
     def say(self, msg: str = "") -> None:
@@ -177,6 +193,7 @@ class Runner:
         ]
         env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
         env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+        env.setdefault("NEEDRESTART_MODE", "a")  # don't stop for needrestart's "restart services?" dialog
         return env
 
     def ensure_sudo(self) -> None:
@@ -202,7 +219,9 @@ class Runner:
         """Run a bash command line. Returns (exit code, combined output)."""
         if sudo and not self.is_root:
             self.ensure_sudo()
-            full = ["sudo", "-E", "bash", "-o", "pipefail", "-c", cmd]
+            # `sudo -E` isn't supported by sudo-rs (Ubuntu 25.10+), so pass what we need explicitly.
+            passed = {"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "a", **(env or {})}
+            full = ["sudo", "env", *[f"{k}={v}" for k, v in passed.items()], "bash", "-o", "pipefail", "-c", cmd]
         else:
             full = ["bash", "-o", "pipefail", "-c", cmd]
         self.ui.cmd(("sudo " if sudo and not self.is_root else "") + cmd)
@@ -216,14 +235,33 @@ class Runner:
                                 errors="replace", bufsize=1)
         lines: List[str] = []
         assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            lines.append(line)
-            if quiet:
-                self.ui.to_file("  | " + line)
-            else:
-                self.ui.out(line)
-        code = proc.wait()
+        started = last_output = time.time()
+        finished = threading.Event()
+        what = self.describe(cmd)
+
+        def heartbeat() -> None:
+            # Long silent steps (downloads, compiles, apt waiting for a lock) must not look frozen.
+            nonlocal last_output
+            while not finished.wait(1):
+                quiet_for = time.time() - last_output
+                if quiet_for >= 15:
+                    self.ui.waiting(f"still {what}… ({int(time.time() - started)}s so far)")
+                    last_output = time.time()
+
+        threading.Thread(target=heartbeat, daemon=True).start()
+        try:
+            for line in proc.stdout:
+                last_output = time.time()
+                line = line.rstrip("\n")
+                lines.append(line)
+                if quiet:
+                    self.ui.to_file("  | " + line)
+                else:
+                    self.ui.out(line)
+            code = proc.wait()
+        finally:
+            finished.set()
+            proc.stdout.close()
         output = "\n".join(lines)
         if check and code != 0:
             tail = "\n".join(lines[-15:])
@@ -239,6 +277,28 @@ class Runner:
         "true; "
     )
 
+    @staticmethod
+    def describe(cmd: str) -> str:
+        """A human phrase for what a command is doing, for "still …" messages."""
+        c = cmd.lower()
+        if "apt-get" in c and " update" in c:
+            return "refreshing apt package lists"
+        if "apt-get" in c and " install" in c:
+            return "installing packages with apt (it waits if another apt/dpkg process holds the lock)"
+        if "apt-get" in c and " purge" in c:
+            return "removing packages with apt"
+        if "add-apt-repository" in c:
+            return "adding the apt repository (contacting Launchpad)"
+        if "curl" in c or "wget" in c:
+            return "downloading"
+        if "pyenv\" install" in c or "pyenv install" in c:
+            return "building Python from source (this takes a few minutes)"
+        if "npm " in c:
+            return "installing npm packages"
+        if "nvm install" in c or "fnm" in c or "mise" in c or "sdk install" in c or "uv\" python" in c:
+            return "downloading and installing with the version manager"
+        return "working"
+
     def capture(self, cmd: str) -> Optional[str]:
         """Run a read-only probe command, even in dry-run. Returns stdout or None."""
         try:
@@ -249,6 +309,12 @@ class Runner:
         if res.returncode != 0:
             return None
         return (res.stdout + res.stderr).strip()
+
+
+def itertools_count(start: float = 0, step: float = 1):
+    """Monotonic fake clock helper (used by tests)."""
+    it = itertools.count(start, step)
+    return lambda: next(it)
 
 
 def q(s: str) -> str:
@@ -262,21 +328,38 @@ def q(s: str) -> str:
 _HTTP_CACHE: Dict[str, object] = {}
 
 
+def http_get(url: str) -> str:
+    """GET a URL quickly or fail quickly.
+
+    curl is tried first: it falls back from a broken IPv6 route to IPv4 in milliseconds
+    (common on WSL), whereas Python's urllib waits out the full timeout per address.
+    """
+    if shutil.which("curl"):
+        try:
+            res = subprocess.run(
+                ["curl", "-4", "-fsSL", "--connect-timeout", "5", "--max-time", "25", "--retry", "1",
+                 "-A", f"config-me/{VERSION}", url],
+                capture_output=True, timeout=60)
+            if res.returncode == 0:
+                return res.stdout.decode("utf-8", errors="replace")
+            raise urllib.error.URLError(f"curl exit {res.returncode}: {res.stderr.decode(errors='replace').strip()}")
+        except subprocess.TimeoutExpired as e:
+            raise urllib.error.URLError(f"timed out fetching {url}") from e
+    req = urllib.request.Request(url, headers={"User-Agent": f"config-me/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
 def http_json(url: str) -> object:
     if url in _HTTP_CACHE:
         return _HTTP_CACHE[url]
-    req = urllib.request.Request(url, headers={"User-Agent": f"config-me/{VERSION}",
-                                               "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = json.loads(http_get(url))
     _HTTP_CACHE[url] = data
     return data
 
 
 def http_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": f"config-me/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    return http_get(url)
 
 
 def strip_prefix(s: str, prefix: str) -> str:
@@ -369,13 +452,25 @@ class Apt:
             self.r.ui.info(self.r.ui.dim("package lists are fresh; skipping apt-get update"))
             self.fresh = True
             return
+        self.announce_lock()
         self.r.run(f"apt-get {self.LOCK} update -y", sudo=True)
         self.fresh = True
+
+    def lock_holder(self) -> Optional[str]:
+        out = self.r.capture("pgrep -a -f 'unattended-upgr|apt-get|apt |dpkg ' | grep -v pgrep | head -1")
+        return out or None
+
+    def announce_lock(self) -> None:
+        holder = self.lock_holder()
+        if holder and not self.r.dry_run:
+            name = "unattended-upgrades" if "unattended" in holder else holder.split()[1] if len(holder.split()) > 1 else holder
+            self.r.ui.warn(f"another package manager process is running ({name}); waiting for it to finish…")
 
     def install(self, *pkgs: str) -> None:
         if not pkgs:
             return
         self.update()
+        self.announce_lock()
         self.r.run(f"apt-get {self.LOCK} install -y --no-install-recommends {' '.join(pkgs)}", sudo=True)
 
     def purge(self, *pkgs: str) -> None:
@@ -395,13 +490,21 @@ class Apt:
         out = self.r.capture(f"apt-cache madison {q(pkg)}") or ""
         return [line.split("|")[1].strip() for line in out.splitlines() if line.count("|") >= 2]
 
-    def add_repo(self, name: str, key_url: str, source: str, armored_key: bool = True) -> None:
-        """Add a signed third-party repository (keyring in /etc/apt/keyrings)."""
+    def add_repo(self, name: str, key_url: str, source: str, armored_key: bool = True,
+                 fingerprint: str = "") -> None:
+        """Add a signed third-party repository (keyring in /etc/apt/keyrings).
+
+        With `fingerprint`, the downloaded key is refused unless it has exactly that fingerprint.
+        """
         self.install("ca-certificates", "curl", "gnupg")
         key = f"/etc/apt/keyrings/{name}.gpg"
-        fetch = f"curl -fsSL --retry 3 --retry-delay 2 {q(key_url)}"
+        fetch = f"curl -4 -fsSL --retry 3 --retry-delay 2 {q(key_url)}"
         dearmor = f" | gpg --dearmor --yes -o {key}" if armored_key else f" -o {key}"
-        self.r.run(f"install -m 0755 -d /etc/apt/keyrings && {fetch}{dearmor} && chmod a+r {key}", sudo=True)
+        verify = ""
+        if fingerprint:
+            verify = (f" && gpg --show-keys --with-colons {key} | grep -q '^fpr:::::::::{fingerprint}:'"
+                      f" || {{ rm -f {key}; echo 'signing key fingerprint mismatch for {name}; refusing it' >&2; exit 1; }}")
+        self.r.run(f"install -m 0755 -d /etc/apt/keyrings && {fetch}{dearmor} && chmod a+r {key}{verify}", sudo=True)
         line = source.replace("{key}", key)
         self.r.run(f"echo {q(line)} > /etc/apt/sources.list.d/{name}.list", sudo=True)
         self.update(force=True)
@@ -446,16 +549,18 @@ class ShellRc:
         return pre + sep + block + "\n" + post.lstrip("\n")
 
     def add(self, tag: str, *lines: str) -> None:
+        """Add a tool's lines if they're missing. If the tool already has lines (tag present),
+        the file is left untouched, including any edits you made to those lines."""
         for f in self.files():
             text = f.read_text() if f.exists() else ""
             pre, body, post = self._split(text)
-            body = [b for b in body if not b.endswith(f"# config-me:{tag}") and not b.startswith("# Managed by config-me")]
+            if any(b.endswith(f"# config-me:{tag}") for b in body):
+                continue
+            body = [b for b in body if not b.startswith("# Managed by config-me")]
             body += [f"{line}  # config-me:{tag}" for line in lines]
-            new = self._join(pre, body, post)
-            if new != text:
-                self.ui.info(self.ui.dim(f"updating {f} ({tag})"))
-                if not self.dry_run:
-                    f.write_text(new)
+            self.ui.info(self.ui.dim(f"adding {tag} setup to {f}"))
+            if not self.dry_run:
+                f.write_text(self._join(pre, body, post))
 
     def remove(self, tag: str) -> None:
         for f in self.files():
@@ -514,6 +619,19 @@ class Ctx:
     rc: ShellRc
     state: State
     dry_run: bool = False
+    # Filled up front by prefetch(), so questions never wait on the network or on probes.
+    detected: Dict[str, Optional["Detected"]] = field(default_factory=dict)
+    hints: Dict[str, str] = field(default_factory=dict)
+
+    def detect(self, item: "Item") -> Optional["Detected"]:
+        if item.id not in self.detected:
+            self.detected[item.id] = item.detect(self)
+        return self.detected[item.id]
+
+    def hint(self, item: "Item") -> str:
+        if item.id not in self.hints:
+            self.hints[item.id] = item.version_hint()
+        return self.hints[item.id]
 
     def sh(self, cmd: str, **kw) -> Tuple[int, str]:
         return self.run.run(cmd, **kw)
@@ -528,6 +646,7 @@ class Detected:
     method: str          # how it was installed (e.g. "tarball", "nvm", "apt", "unknown")
     path: str = ""
     managed: bool = True  # False for things config-me must never remove (system python)
+    problem: str = ""     # installed but broken in the user's environment (shown by -stat and prompts)
 
 
 def first_version(text: Optional[str]) -> Optional[str]:
@@ -545,13 +664,15 @@ MISE = LOCAL_BIN / "mise"
 
 
 def ensure_mise(ctx: Ctx) -> None:
-    if MISE.exists() or shutil.which("mise"):
-        return
-    ctx.ui.info("installing mise (polyglot version manager)")
-    ctx.apt.install("curl", "ca-certificates")
-    ctx.sh("curl -fsSL --retry 3 --retry-delay 2 https://mise.run | sh")
-    ctx.rc.add("mise", 'eval "$($HOME/.local/bin/mise activate $(basename "$SHELL"))"')
-    ctx.state.set("_mise", method="mise.run", version="latest")
+    if not (MISE.exists() or shutil.which("mise")):
+        ctx.ui.info("installing mise (polyglot version manager)")
+        ctx.apt.install("curl", "ca-certificates")
+        ctx.sh("curl -4 -fsSL --retry 3 --retry-delay 2 https://mise.run | sh")
+        ctx.state.set("_mise", method="mise.run", version="latest")
+    # Always (re)wire the shell, even if the manager was already there: a missing rc line
+    # is exactly what makes "installed" tools look absent in new terminals.
+    if MISE.exists() or ctx.dry_run:
+        ctx.rc.add("mise", 'eval "$($HOME/.local/bin/mise activate $(basename "$SHELL"))"')
 
 
 def mise_bin() -> str:
@@ -611,7 +732,7 @@ class Item:
     default_method = ""
     managers: List[Tuple[str, str]] = []   # (key, description) of optional version managers
     has_lts = True
-    version_hint_words = ("LTS", "latest")
+    example = "1.2.3"
 
     # --- versions ---------------------------------------------------------------
     def lts(self) -> str:
@@ -622,6 +743,8 @@ class Item:
 
     def resolve(self, ctx: Ctx, spec: str, method: str) -> str:
         """Turn 'lts' / 'latest' / '22' into what the installer needs."""
+        if not ctx.dry_run and (spec in ("lts", "latest") or self.resolve_needs_lookup(spec)):
+            ctx.ui.info(ctx.ui.dim(f"looking up the {'LTS' if spec == 'lts' and self.has_lts else spec} version of {self.name}…"))
         try:
             if spec == "lts":
                 return self.lts()
@@ -635,6 +758,9 @@ class Item:
 
     def resolve_specific(self, spec: str, method: str) -> str:
         return spec.lstrip("vV")
+
+    def resolve_needs_lookup(self, spec: str) -> bool:
+        return type(self).resolve_specific is not Item.resolve_specific
 
     def version_hint(self) -> str:
         try:
@@ -663,6 +789,7 @@ class Item:
 # ----------------------------------------------------------------------------- Node
 
 class Node(Item):
+    example = "22 or 22.11.0"
     id, name, section = "node", "Node.js", "lang"
     default_method = "official"
     managers = [("nvm", "nvm (Node Version Manager)"), ("fnm", "fnm (fast, Rust-based)"), ("mise", "mise (polyglot)")]
@@ -670,7 +797,8 @@ class Node(Item):
     PREFIX = Path("/usr/local/lib/nodejs")
 
     def _index(self) -> list:
-        return http_json(self.INDEX)  # type: ignore[return-value]
+        """Stable releases only: nodejs.org also lists prereleases like v27.0.0-alpha.0."""
+        return [r for r in http_json(self.INDEX) if re.fullmatch(r"v\d+\.\d+\.\d+", r["version"])]  # type: ignore[union-attr]
 
     def lts(self) -> str:
         return next(r["version"] for r in self._index() if r.get("lts"))
@@ -716,16 +844,16 @@ class Node(Item):
                     tag = http_json("https://api.github.com/repos/nvm-sh/nvm/releases/latest")["tag_name"]  # type: ignore[index]
                 except Exception:  # noqa: BLE001 - fall back to a known release
                     pass
-                ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh | PROFILE=/dev/null bash")
-                ctx.rc.add("nvm", 'export NVM_DIR="$HOME/.nvm"', '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"')
+                ctx.sh(f"curl -4 -fsSL --retry 3 --retry-delay 2 https://raw.githubusercontent.com/nvm-sh/nvm/{tag}/install.sh | PROFILE=/dev/null bash")
+            ctx.rc.add("nvm", 'export NVM_DIR="$HOME/.nvm"', '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"')
             ctx.sh(f'. "$HOME/.nvm/nvm.sh" && nvm install {q(version)} && nvm alias default {q(version)}')
         elif method == "fnm":
             version = self.resolve(ctx, spec, method).lstrip("v")
             fnm = HOME / ".local" / "share" / "fnm" / "fnm"
             if not fnm.exists():
                 ctx.apt.install("curl", "unzip", "ca-certificates")
-                ctx.sh('curl -fsSL --retry 3 --retry-delay 2 https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$HOME/.local/share/fnm"')
-                ctx.rc.add("fnm", 'export PATH="$HOME/.local/share/fnm:$PATH"', 'eval "$(fnm env --use-on-cd --shell $(basename "$SHELL"))"')
+                ctx.sh('curl -4 -fsSL --retry 3 --retry-delay 2 https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$HOME/.local/share/fnm"')
+            ctx.rc.add("fnm", 'export PATH="$HOME/.local/share/fnm:$PATH"', 'eval "$(fnm env --use-on-cd --shell $(basename "$SHELL"))"')
             ctx.sh(f"{fnm} install {q(version)} && {fnm} default {q(version)}")
         elif method == "mise":
             mise_use(ctx, "node", spec.lstrip("vV"))
@@ -738,7 +866,7 @@ class Node(Item):
             ctx.apt.install("curl", "xz-utils", "ca-certificates")
             ctx.sh(
                 f"rm -rf {self.PREFIX} && mkdir -p {self.PREFIX} && "
-                f"curl -fsSL --retry 3 --retry-delay 2 {url} | tar -xJ -C {self.PREFIX} && "
+                f"curl -4 -fsSL --retry 3 --retry-delay 2 {url} | tar -xJ -C {self.PREFIX} && "
                 f"for b in node npm npx corepack; do ln -sf {self.PREFIX}/{pkg}/bin/$b /usr/local/bin/$b; done",
                 sudo=True,
             )
@@ -767,6 +895,7 @@ class Node(Item):
 # ----------------------------------------------------------------------------- .NET
 
 class DotNet(Item):
+    example = "8 or 8.0.404"
     id, name, section = "dotnet", "C# (.NET SDK)", "lang"
     default_method = "dotnet-install"
     managers = [("mise", "mise (polyglot)")]
@@ -814,7 +943,7 @@ class DotNet(Item):
             version = mise_has(ctx, "dotnet") or spec
         else:
             version = self.resolve(ctx, spec, method)
-            ctx.sh(f'curl -fsSL --retry 3 --retry-delay 2 https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && '
+            ctx.sh(f'curl -4 -fsSL --retry 3 --retry-delay 2 https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && '
                    f'bash /tmp/dotnet-install.sh --version {q(version)} --install-dir "$HOME/.dotnet" && rm -f /tmp/dotnet-install.sh')
             ctx.rc.add("dotnet", 'export DOTNET_ROOT="$HOME/.dotnet"', 'export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"',
                        "export DOTNET_CLI_TELEMETRY_OPTOUT=1")
@@ -836,6 +965,7 @@ class DotNet(Item):
 # ----------------------------------------------------------------------------- Java
 
 class Java(Item):
+    example = "21"
     id, name, section = "java", "Java (Eclipse Temurin JDK)", "lang"
     default_method = "temurin-apt"
     managers = [("sdkman", "SDKMAN! (the JVM ecosystem's manager)"), ("mise", "mise (polyglot)")]
@@ -889,11 +1019,11 @@ class Java(Item):
         if method == "sdkman":
             if not (HOME / ".sdkman").exists():
                 ctx.apt.install("curl", "zip", "unzip", "ca-certificates")
-                ctx.sh('curl -fsSL --retry 3 --retry-delay 2 "https://get.sdkman.io?rcupdate=false" | bash')
+                ctx.sh('curl -4 -fsSL --retry 3 --retry-delay 2 "https://get.sdkman.io?rcupdate=false" | bash')
                 # SDKMAN reads its settings from etc/config, not the environment: answer prompts with yes.
                 ctx.sh('sed -i "s/^sdkman_auto_answer=.*/sdkman_auto_answer=true/" "$HOME/.sdkman/etc/config"')
-                ctx.rc.add("sdkman", 'export SDKMAN_DIR="$HOME/.sdkman"',
-                           '[ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && . "$SDKMAN_DIR/bin/sdkman-init.sh"')
+            ctx.rc.add("sdkman", 'export SDKMAN_DIR="$HOME/.sdkman"',
+                       '[ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && . "$SDKMAN_DIR/bin/sdkman-init.sh"')
             ident = major if "-" in major else (self._sdkman_id(ctx, major) if not ctx.dry_run else f"{major}-tem")
             ctx.sh(f'. "$HOME/.sdkman/bin/sdkman-init.sh" && sdk install java {q(ident)} < /dev/null && sdk default java {q(ident)}')
             version = ident
@@ -929,6 +1059,7 @@ class Java(Item):
 # ----------------------------------------------------------------------------- Go
 
 class Go(Item):
+    example = "1.24 or 1.24.3"
     id, name, section = "go", "Go", "lang"
     default_method = "official"
     managers = [("mise", "mise (polyglot)")]
@@ -948,15 +1079,23 @@ class Go(Item):
 
     def detect(self, ctx: Ctx) -> Optional[Detected]:
         out = ctx.probe("go version")
+        problem = ""
         if not out:
-            return None
+            # A stale GOROOT (e.g. left behind by goenv) breaks every go command; look past it.
+            goroot = os.environ.get("GOROOT", "")
+            out = ctx.probe("env -u GOROOT go version") if goroot else None
+            if not out:
+                return None
+            problem = (f"GOROOT is set to {goroot}, which {'does not exist' if not Path(goroot).is_dir() else 'is not this Go'}, "
+                       "so `go` fails in your shell. Find where it's set with `bash -lixc exit 2>&1 | grep -n GOROOT`, "
+                       "remove that line, then `unset GOROOT` (or open a new terminal).")
         m = re.search(r"go(\d+\.\d+(?:\.\d+)?)", out)
         path = ctx.probe("command -v go") or ""
         method = self.method_of(ctx, "")
         if not method:
             method = ("official" if path.startswith("/usr/local/go") else "mise" if "mise" in path else
                       "apt" if ctx.apt.installed("golang-go") else "unknown")
-        return Detected(m.group(1) if m else "?", method, path)
+        return Detected(m.group(1) if m else "?", method, path, problem=problem)
 
     def install(self, ctx: Ctx, spec: str, method: str) -> str:
         if method == "mise":
@@ -966,10 +1105,14 @@ class Go(Item):
             version = self.resolve(ctx, spec, method)
             garch, _ = arch()
             ctx.apt.install("curl", "ca-certificates")
-            ctx.sh(f"rm -rf /usr/local/go && curl -fsSL --retry 3 --retry-delay 2 https://go.dev/dl/go{version}.linux-{garch}.tar.gz | tar -xz -C /usr/local",
+            ctx.sh(f"rm -rf /usr/local/go && curl -4 -fsSL --retry 3 --retry-delay 2 https://go.dev/dl/go{version}.linux-{garch}.tar.gz | tar -xz -C /usr/local",
                    sudo=True)
             ctx.rc.add("go", 'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"')
             method = "official"
+            goroot = os.environ.get("GOROOT", "")
+            if goroot and goroot != "/usr/local/go":
+                ctx.ui.warn(f"your shell sets GOROOT={goroot}; `go` will fail until you remove it. Find where with "
+                            "`bash -lixc exit 2>&1 | grep -n GOROOT`. The official build needs no GOROOT.")
         ctx.state.set(self.id, method=method, version=version)
         return version
 
@@ -987,6 +1130,7 @@ class Go(Item):
 # ----------------------------------------------------------------------------- Python
 
 class Python(Item):
+    example = "3.12"
     id, name, section = "python", "Python", "lang"
     default_method = "deadsnakes"
     managers = [("uv", "uv (Astral; fast, manages Pythons + venvs)"), ("pyenv", "pyenv (builds from source)"),
@@ -1046,7 +1190,7 @@ class Python(Item):
         if method == "uv":
             if not (LOCAL_BIN / "uv").exists():
                 ctx.apt.install("curl", "ca-certificates")
-                ctx.sh("curl -LsSf --retry 3 --retry-delay 2 https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh")
+                ctx.sh("curl -4 -LsSf --retry 3 --retry-delay 2 https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh")
                 ensure_local_bin_on_path(ctx)
             target = "" if spec in ("lts", "latest") else spec
             ctx.sh(f'"$HOME/.local/bin/uv" python install --default --preview {q(target) if target else ""}'.rstrip())
@@ -1055,9 +1199,9 @@ class Python(Item):
             version = self.resolve(ctx, spec, method)
             ctx.apt.install(*self.PYENV_DEPS)
             if not (HOME / ".pyenv").exists():
-                ctx.sh("curl -fsSL --retry 3 --retry-delay 2 https://pyenv.run | bash")
-                ctx.rc.add("pyenv", 'export PYENV_ROOT="$HOME/.pyenv"', 'export PATH="$PYENV_ROOT/bin:$PATH"',
-                           'eval "$(pyenv init - $(basename "$SHELL"))"')
+                ctx.sh("curl -4 -fsSL --retry 3 --retry-delay 2 https://pyenv.run | bash")
+            ctx.rc.add("pyenv", 'export PYENV_ROOT="$HOME/.pyenv"', 'export PATH="$PYENV_ROOT/bin:$PATH"',
+                       'eval "$(pyenv init - $(basename "$SHELL"))"')
             ctx.sh(f'"$HOME/.pyenv/bin/pyenv" install --skip-existing {q(version)} && "$HOME/.pyenv/bin/pyenv" global {q(version)}')
         elif method == "mise":
             mise_use(ctx, "python", "latest" if spec in ("lts", "latest") else spec)
@@ -1065,17 +1209,35 @@ class Python(Item):
         else:
             version = self.resolve(ctx, spec, method)
             minor = ".".join(version.split(".")[:2])
-            ctx.apt.install("software-properties-common")
-            if not ctx.apt.candidates(f"python{minor}") or not ctx.probe(f"apt-cache policy python{minor} | grep -q deadsnakes && echo y"):
-                ctx.sh("for i in 1 2 3; do add-apt-repository -y ppa:deadsnakes/ppa && exit 0; "
-                       "echo 'Launchpad request failed; retrying in 10s'; sleep 10; done; exit 1", sudo=True)
-                ctx.apt.update(force=True)
+            if not ctx.apt.candidates(f"python{minor}"):
+                self.add_deadsnakes(ctx, minor)
             ctx.apt.install(f"python{minor}", f"python{minor}-venv", f"python{minor}-dev")
             version = first_version(ctx.probe(f"python{minor} --version")) or version
             method = "deadsnakes"
             ctx.ui.info(f"run it as python{minor} (Ubuntu's own python3 is left alone; the OS depends on it)")
         ctx.state.set(self.id, method=method, version=version)
         return version
+
+    DEADSNAKES_URL = "https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu"
+    DEADSNAKES_FPR = "F23C5A6CF475977595C89F51BA6932366A755776"
+
+    def add_deadsnakes(self, ctx: Ctx, minor: str) -> None:
+        """Add the deadsnakes PPA directly (key via curl, verified by fingerprint).
+
+        `add-apt-repository` is avoided on purpose: it calls Launchpad's API from Python,
+        which can hang for minutes on hosts with broken IPv6 (common on WSL).
+        """
+        codename = ubuntu_codename()
+        if not ctx.dry_run and ctx.probe(f"curl -4 -fsI --max-time 15 {self.DEADSNAKES_URL}/dists/{codename}/Release "
+                                         ">/dev/null && echo ok") != "ok":
+            raise CommandError(f"Python {minor} isn't in Ubuntu's repositories, and the deadsnakes PPA doesn't support "
+                               f"Ubuntu '{codename}' (yet). Re-run and choose the uv or pyenv version manager instead.")
+        ctx.apt.add_repo(
+            "deadsnakes",
+            f"https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x{self.DEADSNAKES_FPR}",
+            f"deb [signed-by={{key}}] {self.DEADSNAKES_URL} {codename} main",
+            fingerprint=self.DEADSNAKES_FPR,
+        )
 
     def uninstall(self, ctx: Ctx, det: Detected) -> None:
         if not det.managed:
@@ -1093,13 +1255,17 @@ class Python(Item):
         elif det.method == "deadsnakes":
             minor = ".".join(st.get("version", det.version).split(".")[:2])
             ctx.apt.purge(f"python{minor}", f"python{minor}-venv", f"python{minor}-dev")
-            ctx.sh("add-apt-repository -y --remove ppa:deadsnakes/ppa || true", sudo=True, check=False)
+            ctx.apt.remove_repo("deadsnakes")
+            # also clean up a PPA added the old way (add-apt-repository naming)
+            ctx.sh("rm -f /etc/apt/sources.list.d/deadsnakes-ubuntu-ppa-*.list /etc/apt/sources.list.d/deadsnakes-ubuntu-ppa-*.sources",
+                   sudo=True, check=False)
         ctx.state.drop(self.id)
 
 
 # ----------------------------------------------------------------------------- Rust
 
 class Rust(Item):
+    example = "1.82.0"
     id, name, section = "rust", "Rust", "lang"
     default_method = "rustup"
     managers = [("mise", "mise (polyglot; rustup is used by default and is Rust's official manager)")]
@@ -1129,12 +1295,12 @@ class Rust(Item):
             mise_use(ctx, "rust", toolchain)
         else:
             if not (HOME / ".cargo" / "bin" / "rustup").exists():
-                ctx.sh(f"curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 2 https://sh.rustup.rs | sh -s -- -y --no-modify-path "
+                ctx.sh(f"curl -4 --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 2 https://sh.rustup.rs | sh -s -- -y --no-modify-path "
                        f"--default-toolchain {q(toolchain)} --profile default")
-                ctx.rc.add("rust", '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"')
             else:
                 ctx.sh(f'"$HOME/.cargo/bin/rustup" update {q(toolchain)} || "$HOME/.cargo/bin/rustup" toolchain install {q(toolchain)}')
                 ctx.sh(f'"$HOME/.cargo/bin/rustup" default {q(toolchain)}')
+            ctx.rc.add("rust", '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"')
             method = "rustup"
         version = first_version(ctx.probe('"$HOME/.cargo/bin/rustc" --version || rustc --version')) or toolchain
         ctx.state.set(self.id, method=method, version=version)
@@ -1155,6 +1321,7 @@ class Rust(Item):
 
 class AptEngine(Item):
     """Container engines installed from apt; versions come from `apt-cache madison`."""
+    example = "27.3"
     section = "containers"
     has_lts = False
     packages: Tuple[str, ...] = ()
@@ -1277,7 +1444,7 @@ class Containerd(AptEngine):
         except Exception:  # noqa: BLE001
             tag = "v2.0.3"
         ver = str(tag).lstrip("v")
-        ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://github.com/containerd/nerdctl/releases/download/v{ver}/nerdctl-{ver}-linux-{a}.tar.gz "
+        ctx.sh(f"curl -4 -fsSL --retry 3 --retry-delay 2 https://github.com/containerd/nerdctl/releases/download/v{ver}/nerdctl-{ver}-linux-{a}.tar.gz "
                f"| tar -xz -C /usr/local/bin nerdctl", sudo=True)
         self.start_service(ctx, "containerd")
         ctx.ui.info("use `sudo nerdctl run …` (docker-compatible CLI)")
@@ -1292,6 +1459,7 @@ class Containerd(AptEngine):
 
 class NpmCli(Item):
     """An AI CLI distributed on npm, installed into ~/.local with Node.js."""
+    example = "0.60.0"
     section = "ai"
     has_lts = False
     package = ""
@@ -1333,6 +1501,7 @@ class NpmCli(Item):
 
 
 class ClaudeCode(Item):
+    example = "2.1.0"
     id, name, section = "claude", "Claude Code (Anthropic)", "ai"
     has_lts = True
 
@@ -1356,7 +1525,7 @@ class ClaudeCode(Item):
     def install(self, ctx: Ctx, spec: str, method: str) -> str:
         arg = {"lts": "stable", "latest": "latest"}.get(spec, spec.lstrip("vV"))
         ctx.apt.install("curl", "ca-certificates")
-        ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://claude.ai/install.sh | bash -s {q(arg)}")
+        ctx.sh(f"curl -4 -fsSL --retry 3 --retry-delay 2 https://claude.ai/install.sh | bash -s {q(arg)}")
         ensure_local_bin_on_path(ctx)
         version = first_version(ctx.probe(f"{LOCAL_BIN}/claude --version 2>&1")) or arg
         ctx.state.set(self.id, method="native", version=version)
@@ -1381,6 +1550,7 @@ class Gemini(NpmCli):
 
 
 class Copilot(Item):
+    example = "0.0.369"
     id, name, section = "copilot", "GitHub Copilot CLI", "ai"
     has_lts = False
 
@@ -1401,7 +1571,7 @@ class Copilot(Item):
     def install(self, ctx: Ctx, spec: str, method: str) -> str:
         ctx.apt.install("curl", "ca-certificates")
         env = 'PREFIX="$HOME/.local"' + ("" if spec in ("lts", "latest") else f" VERSION={q('v' + spec.lstrip('vV'))}")
-        ctx.sh(f"curl -fsSL --retry 3 --retry-delay 2 https://gh.io/copilot-install | {env} bash")
+        ctx.sh(f"curl -4 -fsSL --retry 3 --retry-delay 2 https://gh.io/copilot-install | {env} bash")
         ensure_local_bin_on_path(ctx)
         version = first_version(ctx.probe(f"{LOCAL_BIN}/copilot --version 2>&1")) or spec
         ctx.state.set(self.id, method="script", version=version)
@@ -1430,14 +1600,22 @@ def items_in(section: str) -> List[Item]:
 # =============================================================================
 
 class Prompt:
-    def __init__(self, ui: UI, assume_yes: bool = False):
+    """User input.
+
+    * `assume_yes` (-y): yes/no confirmations ("Go ahead?", "Proceed?") are answered "yes".
+      Your choices (what to install, which version, which manager) are still asked.
+    * `automatic` (-blang): nothing is asked at all; every question takes its default.
+    """
+
+    def __init__(self, ui: UI, assume_yes: bool = False, automatic: bool = False):
         self.ui = ui
-        self.yes = assume_yes
+        self.yes = assume_yes or automatic
+        self.auto = automatic
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
     def line(self, text: str, default: str = "") -> str:
-        if self.yes:
-            self.ui.say(f"{text}{self.ui.dim(default or '<Enter>')}  (-y)")
+        if self.auto:
+            self.ui.say(f"{text}{self.ui.dim(default or '<Enter>')}  (automatic)")
             return default
         try:
             ans = input(text)
@@ -1447,16 +1625,19 @@ class Prompt:
 
     def confirm(self, text: str, default: bool = True) -> bool:
         hint = "[Y/n]" if default else "[y/N]"
+        if self.yes:
+            self.ui.say(f"{text} {hint} {self.ui.dim('y')}  (-y)")
+            return True
         ans = self.line(f"{text} {hint} ", "y" if default else "n").lower()
         return ans in ("y", "yes")
 
     def checklist(self, title: str, options: List[Tuple[str, str]], defaults: Sequence[str] = (),
                   radio: bool = False, default_if_yes: Sequence[str] = ()) -> List[str]:
         """Multi-select (or single-select when radio=True). Returns selected keys."""
-        if self.yes:
+        if self.auto:
             chosen = list(default_if_yes)
             labels = ", ".join(lbl for k, lbl in options if k in chosen) or "none"
-            self.ui.say(f"{self.ui.bold(title)}: {labels}  (-y)")
+            self.ui.say(f"{self.ui.bold(title)}: {labels}  (automatic)")
             return chosen
         if self.interactive:
             try:
@@ -1595,21 +1776,74 @@ def parse_version_answer(ans: str) -> Optional[str]:
     return a
 
 
+# Extra lookups that installers make later; warming them now keeps execution snappy too.
+PREFETCH_URLS = (
+    "https://api.github.com/repos/nvm-sh/nvm/releases/latest",
+    "https://api.github.com/repos/containerd/nerdctl/releases/latest",
+)
+
+
+def prefetch(ctx: Ctx, items: Sequence[Item], hints: bool = True) -> None:
+    """Check what's installed and look up available versions for every item, in parallel,
+    before any question is asked. Shows one progress line while it works."""
+    ui = ctx.ui
+    jobs: List[Tuple[str, Callable[[], object]]] = [(f"detect:{i.id}", lambda i=i: ctx.detect(i)) for i in items]
+    if hints:
+        jobs += [(f"hint:{i.id}", lambda i=i: ctx.hint(i)) for i in items]
+        jobs += [(f"url:{u}", lambda u=u: http_json(u)) for u in PREFETCH_URLS]
+    what = "checking what's installed and looking up the latest versions online" if hints else "checking what's installed"
+    total, done = len(jobs), 0
+    started = time.time()
+
+    def show(final: bool = False) -> None:
+        text = f"  {what}… {done}/{total}" + (f" ({time.time() - started:.0f}s)" if final else "")
+        if ui.tty:
+            sys.stdout.write("\r\033[K" + ui.dim(text) + ("\n" if final else ""))
+            sys.stdout.flush()
+        elif final:
+            print(text, flush=True)
+
+    if not ui.tty:
+        print(f"  {what}…", flush=True)
+    show()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        futures = {pool.submit(fn): name for name, fn in jobs}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:  # noqa: BLE001 - a failed lookup only means no hint
+                ui.to_file(f"  prefetch {futures[fut]} failed: {e}")
+            done += 1
+            show()
+    show(final=True)
+    if hints:
+        missing = [i.name for i in items if not ctx.hints.get(i.id)]
+        if missing and len(missing) == len(items):
+            ui.say(ui.yellow("  couldn't reach the version servers (offline?); you can still type versions, "
+                             "and lookups will be retried when installing"))
+
+
 def ask_item(prompt: Prompt, ctx: Ctx, item: Item, ask_manager: bool) -> Optional[Action]:
     ui = ctx.ui
-    det = item.detect(ctx)
     ui.say()
     ui.say(ui.bold(f"── {item.name} ") + ui.dim("─" * max(2, 40 - len(item.name))))
+    det = ctx.detect(item)
     kind = "install"
     if det:
         where = f" ({det.method}{', ' + det.path if det.path else ''})"
         ui.say(f"  installed: {ui.green(det.version)}{ui.dim(where)}")
+        if det.problem:
+            ui.say(ui.yellow(f"  ! {det.problem}"))
         if not det.managed:
             ui.say(ui.dim("  this is the OS's own copy; config-me can install another version alongside it"))
-        choices = "[U]pdate / [r]emove / [k]eep" if det.managed else "[U]pdate (install alongside) / [k]eep"
-        valid = ("u", "update", "y", "r", "remove", "k", "keep", "n") if det.managed else ("u", "update", "y", "k", "keep", "n")
+        if det.managed:
+            question = f"  {item.name} is already installed. Update, remove, or keep it? [U/r/k] (Enter = update): "
+            valid = ("u", "update", "y", "r", "remove", "k", "keep", "n")
+        else:
+            question = f"  Install another {item.name} alongside it, or keep just this one? [U/k] (Enter = install): "
+            valid = ("u", "update", "y", "k", "keep", "n")
         while True:
-            ans = prompt.line(f"  {choices}: ", "u").lower()
+            ans = prompt.line(question, "u").lower()
             if ans in valid:
                 break
             ui.say(ui.yellow("  answer u (update), " + ("r (remove), " if det.managed else "") + "or k (keep)"))
@@ -1618,11 +1852,13 @@ def ask_item(prompt: Prompt, ctx: Ctx, item: Item, ask_manager: bool) -> Optiona
         if ans in ("r", "remove"):
             return Action(item, "remove", detected=det)
         kind = "update"
-    hint = item.version_hint()
-    ui.say(ui.dim(f"  {hint}") if hint else "")
-    lts_word = "LTS" if item.has_lts else "latest"
+    hint = "" if prompt.auto else ctx.hint(item)
+    if hint:
+        ui.say(ui.dim(f"  available: {hint}"))
+    lts_word = "latest LTS" if item.has_lts else "latest"
+    ui.say(f"  Enter or y = {lts_word} · 'latest' = newest release · or type a version (e.g. {item.example}) · n = skip")
     while True:
-        ans = prompt.line(f"  Version? [Enter/y = {lts_word}, 'latest', a version like 22 or 22.11.0, n = skip]: ", "y")
+        ans = prompt.line(f"  Which version of {item.name} do you want? ", "y")
         spec = parse_version_answer(ans)
         if spec is None:
             return None
@@ -1638,7 +1874,8 @@ def ask_item(prompt: Prompt, ctx: Ctx, item: Item, ask_manager: bool) -> Optiona
                         "temurin-apt": "Adoptium Temurin apt repo", "deadsnakes": "deadsnakes apt packages",
                         "rustup": "rustup"}.get(item.default_method, item.default_method)
         while True:
-            ans = prompt.line(f"  Use a version manager? [{names}, Enter/n = no ({default_desc})]: ", "n").lower()
+            ans = prompt.line(f"  Install {item.name} with a version manager? [{names}] (Enter or n = no, use {default_desc}): ",
+                              "n").lower()
             if ans in ("", "n", "no", "none"):
                 break
             if ans in {k for k, _ in item.managers}:
@@ -1651,6 +1888,8 @@ def ask_item(prompt: Prompt, ctx: Ctx, item: Item, ask_manager: bool) -> Optiona
 def interactive_plan(prompt: Prompt, ctx: Ctx, assume_yes: bool) -> Plan:
     plan = Plan()
     ui = ctx.ui
+    prefetch(ctx, list(ITEMS.values()))
+    ui.say()
 
     # 1. Languages
     langs = items_in("lang")
@@ -1667,7 +1906,7 @@ def interactive_plan(prompt: Prompt, ctx: Ctx, assume_yes: bool) -> Plan:
     picked = prompt.checklist("2) Container engine (pick one, or none)", [(i.id, i.name) for i in engines],
                               radio=True, default_if_yes=["docker"])
     if picked:
-        others = [e for e in engines if e.id != picked[0] and e.detect(ctx)]
+        others = [e for e in engines if e.id != picked[0] and ctx.detect(e)]
         if others:
             ui.say(ui.yellow(f"  note: {', '.join(e.name for e in others)} is also installed; "
                              f"remove it with `config-me -rm {others[0].id}` if they conflict"))
@@ -1689,7 +1928,7 @@ def interactive_plan(prompt: Prompt, ctx: Ctx, assume_yes: bool) -> Plan:
 def blang_plan(ctx: Ctx) -> Plan:
     plan = Plan()
     for item in items_in("lang"):
-        det = item.detect(ctx)
+        det = ctx.detect(item)
         plan.actions.append(Action(item, "update" if det else "install", "lts", item.default_method, det))
     return plan
 
@@ -1770,14 +2009,18 @@ def execute(ctx: Ctx, plan: Plan) -> int:
 def cmd_stat(ctx: Ctx) -> int:
     ui = ctx.ui
     ui.say(ui.bold(f"config-me {VERSION}") + ui.dim(f"  (state: {STATE_FILE})"))
+    prefetch(ctx, list(ITEMS.values()), hints=False)
     for sec, title in SECTIONS.items():
         ui.say()
         ui.say(ui.bold(title))
         for item in items_in(sec):
-            det = item.detect(ctx)
+            det = ctx.detect(item)
             if det:
                 extra = det.method + ("" if det.managed else ", not managed")
-                ui.say(f"  {ui.green('●')} {item.name:<36} {det.version:<22} {ui.dim(extra)}")
+                mark = ui.yellow("●") if det.problem else ui.green("●")
+                ui.say(f"  {mark} {item.name:<36} {det.version:<22} {ui.dim(extra)}")
+                if det.problem:
+                    ui.say(ui.yellow(f"      ! {det.problem}"))
             else:
                 ui.say(f"  {ui.dim('○')} {item.name:<36} {ui.dim('not installed')}")
     ui.say()
@@ -1794,7 +2037,8 @@ def cmd_stat(ctx: Ctx) -> int:
 def cmd_rm(ctx: Ctx, prompt: Prompt, names: Sequence[str]) -> int:
     ui = ctx.ui
     targets = resolve_targets(names)
-    found = [(i, d) for i in targets for d in [i.detect(ctx)] if d]
+    prefetch(ctx, targets, hints=False)
+    found = [(i, d) for i in targets for d in [ctx.detect(i)] if d]
     removable = [(i, d) for i, d in found if d.managed]
     for i, d in found:
         if not d.managed:
@@ -1870,7 +2114,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     check_platform(ui)
     run = Runner(ui, dry_run=args.dry_run)
     ctx = Ctx(ui=ui, run=run, apt=Apt(run), rc=ShellRc(ui, args.dry_run), state=State(args.dry_run), dry_run=args.dry_run)
-    prompt = Prompt(ui, assume_yes=args.yes or args.blang)
+    prompt = Prompt(ui, assume_yes=args.yes, automatic=args.blang)
     if args.dry_run:
         ui.say(ui.yellow("dry run: nothing will be changed"))
     try:
@@ -1890,7 +2134,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ui.say(ui.bold("Plan:"))
         for a in plan.actions:
             ui.say(f"  - {a.label()}")
-        if not args.yes and not args.blang and not prompt.confirm("Go ahead?", default=True):
+        if not prompt.confirm("Go ahead?", default=True):
             ui.say("Aborted.")
             return 1
         return execute(ctx, plan)

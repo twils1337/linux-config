@@ -32,6 +32,7 @@ cm = load()
 
 FIXTURES = {
     cm.Node.INDEX: [
+        {"version": "v26.0.0-alpha.0.1.1", "lts": False},
         {"version": "v25.2.0", "lts": False},
         {"version": "v24.11.1", "lts": "Krypton"},
         {"version": "v24.10.0", "lts": False},
@@ -120,7 +121,10 @@ class Resolution(Base):
     def test_node(self):
         n = cm.Node()
         self.assertEqual(n.lts(), "v24.11.1")
-        self.assertEqual(n.latest(), "v25.2.0")
+        self.assertEqual(n.latest(), "v25.2.0", "prereleases are not 'latest'")
+        self.assertEqual(n.resolve_specific("26", "official") if False else n.lts(), "v24.11.1")
+        with self.assertRaises(ValueError):
+            n.resolve_specific("26", "official")
         self.assertEqual(n.resolve_specific("22", "official"), "v22.21.0")
 
     def test_dotnet_skips_preview_and_eol(self):
@@ -182,6 +186,154 @@ class Sdkman(Base):
                 cm.Java()._sdkman_id(ctx, "99")
 
 
+class AskItem(Base):
+    def test_automatic_mode_never_waits_on_network_lookups(self):
+        ctx = self.ctx()
+        prompt = cm.Prompt(ctx.ui, automatic=True)
+        with mock.patch.object(cm.Go, "detect", return_value=None), \
+             mock.patch.object(cm.Go, "version_hint", side_effect=AssertionError("looked up versions under -y")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            act = cm.ask_item(prompt, ctx, cm.ITEMS["go"], ask_manager=True)
+        self.assertEqual((act.kind, act.spec, act.method), ("install", "lts", "official"))
+
+    def test_interactive_prints_the_question(self):
+        ctx = self.ctx(mute=False)
+        prompt = cm.Prompt(ctx.ui)
+        asked = []
+        with mock.patch.object(cm.Go, "detect", return_value=None), \
+             mock.patch("builtins.input", side_effect=lambda q: asked.append(q) or ""), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cm.ask_item(prompt, ctx, cm.ITEMS["go"], ask_manager=True)
+        self.assertTrue(any("Which version of Go" in q for q in asked), asked)
+        self.assertTrue(any("version manager" in q for q in asked), asked)
+
+
+class Waiting(Base):
+    def test_quiet_command_gets_a_still_working_notice(self):
+        ui = cm.UI(mute=False)
+        run = cm.Runner(ui)
+        buf = io.StringIO()
+        with mock.patch.object(cm.time, "time", side_effect=cm.itertools_count(0, 20)), \
+             contextlib.redirect_stdout(buf):
+            run.run("sleep 1.5; echo done", check=False)
+        self.assertIn("still", buf.getvalue())
+
+    def test_describe(self):
+        self.assertIn("apt", cm.Runner.describe("apt-get -o x install -y curl"))
+        self.assertEqual(cm.Runner.describe("curl -fsSL x | tar -x"), "downloading")
+
+
+class Prefetch(Base):
+    def test_everything_is_looked_up_once_before_questions(self):
+        ctx = self.ctx(mute=False)
+        calls = {"detect": 0, "hint": 0}
+
+        def det(self_, c):
+            calls["detect"] += 1
+            return None
+
+        def hint(self_):
+            calls["hint"] += 1
+            cm.time.sleep(0.2)  # slow lookups run in parallel, not one after another
+            return "latest=1.0"
+
+        with mock.patch.object(cm.Item, "detect", det), mock.patch.object(cm.Item, "version_hint", hint), \
+             mock.patch.object(cm.NpmCli, "version_hint", hint), mock.patch.object(cm.Rust, "version_hint", hint), \
+             mock.patch.object(cm.AptEngine, "version_hint", hint), mock.patch.object(cm.ClaudeCode, "version_hint", hint), \
+             mock.patch.object(cm.Copilot, "version_hint", hint), \
+             mock.patch.object(cm.Node, "detect", det), mock.patch.object(cm.DotNet, "detect", det), \
+             mock.patch.object(cm.Java, "detect", det), mock.patch.object(cm.Go, "detect", det), \
+             mock.patch.object(cm.Python, "detect", det), mock.patch.object(cm.Rust, "detect", det), \
+             mock.patch.object(cm.AptEngine, "detect", det), mock.patch.object(cm.Containerd, "detect", det), \
+             mock.patch.object(cm.NpmCli, "detect", det), mock.patch.object(cm.ClaudeCode, "detect", det), \
+             mock.patch.object(cm.Copilot, "detect", det), contextlib.redirect_stdout(io.StringIO()):
+            start = cm.time.time()
+            cm.prefetch(ctx, list(cm.ITEMS.values()))
+            elapsed = cm.time.time() - start
+            self.assertEqual(calls, {"detect": len(cm.ITEMS), "hint": len(cm.ITEMS)})
+            self.assertLess(elapsed, 0.2 * len(cm.ITEMS) / 2, "lookups should run in parallel")
+            with mock.patch("builtins.input", return_value=""):
+                cm.ask_item(cm.Prompt(ctx.ui), ctx, cm.ITEMS["go"], ask_manager=True)
+            self.assertEqual(calls, {"detect": len(cm.ITEMS), "hint": len(cm.ITEMS)}, "questions reuse the cache")
+
+
+class IPv4(unittest.TestCase):
+    def test_vendor_installers_curl_is_left_alone(self):
+        self.assertNotIn("CURL_HOME", cm.Runner(cm.UI(mute=True)).env())
+
+
+class Sudo(unittest.TestCase):
+    def test_sudo_passes_env_explicitly_without_dash_e(self):
+        run = cm.Runner(cm.UI(mute=True))
+        run.is_root, run._sudo_ok = False, True
+        with mock.patch.object(cm.subprocess, "Popen") as popen:
+            popen.return_value.stdout = io.StringIO("")
+            popen.return_value.wait.return_value = 0
+            run.run("apt-get install -y curl", sudo=True)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:2], ["sudo", "env"])
+        self.assertNotIn("-E", argv, "sudo-rs (Ubuntu 25.10+) rejects -E")
+        self.assertIn("DEBIAN_FRONTEND=noninteractive", argv)
+
+
+class Deadsnakes(Base):
+    def test_added_with_curl_and_verified_key_not_add_apt_repository(self):
+        ctx = self.ctx(dry_run=True, mute=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cm.Python().add_deadsnakes(ctx, "3.14")
+        out = buf.getvalue()
+        self.assertNotIn("add-apt-repository", out)
+        self.assertIn("curl -4", out)
+        self.assertIn(cm.Python.DEADSNAKES_FPR, out, "key must be checked against its fingerprint")
+
+
+class StaleGoroot(Base):
+    def test_go_with_a_stale_goroot_is_detected_and_explained(self):
+        ctx = self.ctx()
+        answers = {"go version": None, "env -u GOROOT go version": "go version go1.27.4 linux/amd64",
+                   "command -v go": "/usr/local/go/bin/go"}
+        with mock.patch.dict(os.environ, {"GOROOT": "/home/x/.goenv/versions/1.25.5"}), \
+             mock.patch.object(ctx, "probe", side_effect=lambda c: answers.get(c)):
+            det = cm.Go().detect(ctx)
+        self.assertIsNotNone(det, "a stale GOROOT must not make Go look uninstalled")
+        self.assertEqual((det.version, det.method), ("1.27.4", "official"))
+        self.assertIn("GOROOT", det.problem)
+        self.assertIn("does not exist", det.problem)
+
+
+class RcLinesOnUpdate(Base):
+    """A tool whose manager already exists (earlier run, manual install) must still get its
+    ~/.bashrc line; otherwise it looks uninstalled in every new terminal."""
+
+    def bashrc(self):
+        return (Path(self.home.name) / ".bashrc").read_text()
+
+    def test_existing_rustup_still_gets_its_path_line(self):
+        cargo_bin = Path(self.home.name) / ".cargo" / "bin"
+        cargo_bin.mkdir(parents=True)
+        (cargo_bin / "rustup").write_text("")
+        (Path(self.home.name) / ".bashrc").write_text("")
+        ctx = self.ctx(dry_run=False)
+        ctx.rc = cm.ShellRc(ctx.ui)  # really write the rc file
+        with mock.patch.object(ctx, "sh", return_value=(0, "")), mock.patch.object(ctx.apt, "install"), \
+             mock.patch.object(ctx, "probe", return_value="rustc 1.91.0"), mock.patch.object(ctx.state, "set"):
+            cm.Rust().install(ctx, "lts", "rustup")
+        self.assertIn("# config-me:rust", self.bashrc())
+
+    def test_existing_nvm_still_gets_its_lines(self):
+        nvm = Path(self.home.name) / ".nvm"
+        nvm.mkdir()
+        (nvm / "nvm.sh").write_text("")
+        (Path(self.home.name) / ".bashrc").write_text("")
+        ctx = self.ctx(dry_run=False)
+        ctx.rc = cm.ShellRc(ctx.ui)
+        with mock.patch.object(ctx, "sh", return_value=(0, "")), mock.patch.object(ctx.apt, "install"), \
+             mock.patch.object(ctx.state, "set"):
+            cm.Node().install(ctx, "22.21.0", "nvm")
+        self.assertIn("# config-me:nvm", self.bashrc())
+
+
 class Executor(Base):
     def test_one_failing_item_does_not_stop_the_rest(self):
         ctx = self.ctx(dry_run=True)
@@ -202,17 +354,28 @@ class ShellRcBlock(Base):
         rc = cm.ShellRc(cm.UI(mute=True))
         rc.add("go", 'export PATH="/usr/local/go/bin:$PATH"')
         rc.add("rust", '. "$HOME/.cargo/env"')
-        rc.add("go", 'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"')  # replaces, doesn't duplicate
+        before = rc_path.read_text()
+        rc.add("go", 'export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"')  # already there: untouched
+        rc.add("rust", '. "$HOME/.cargo/env"')
         text = rc_path.read_text()
+        self.assertEqual(text, before, "existing lines are left alone (no rewrite, no reordering)")
         self.assertIn("alias ll='ls -l'", text)
         self.assertEqual(text.count(cm.RC_BEGIN), 1)
         self.assertEqual(text.count("# config-me:go"), 1)
-        self.assertIn("$HOME/go/bin", text)
         rc.remove("go")
         rc.remove("rust")
         text = rc_path.read_text()
         self.assertNotIn(cm.RC_BEGIN, text, "empty block is removed entirely")
         self.assertIn("alias ll='ls -l'", text)
+
+    def test_user_edits_to_a_line_are_kept(self):
+        rc_path = Path(self.home.name) / ".bashrc"
+        rc = cm.ShellRc(cm.UI(mute=True))
+        rc.add("go", 'export PATH="/usr/local/go/bin:$PATH"')
+        edited = rc_path.read_text().replace('export PATH="/usr/local/go/bin', 'PATH="/usr/local/go/bin')
+        rc_path.write_text(edited)
+        rc.add("go", 'export PATH="/usr/local/go/bin:$PATH"')
+        self.assertEqual(rc_path.read_text(), edited)
 
     def test_zshrc_only_if_present(self):
         rc = cm.ShellRc(cm.UI(mute=True))
@@ -280,9 +443,20 @@ class Prompts(unittest.TestCase):
         with mock.patch("builtins.input", return_value=""), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(p.checklist("t", opts, radio=True), [], "Enter skips the radio")
 
-    def test_assume_yes_uses_defaults(self):
+    def test_assume_yes_only_answers_confirmations(self):
         p = cm.Prompt(cm.UI(mute=True), assume_yes=True)
-        with contextlib.redirect_stdout(io.StringIO()):
+        p.interactive = False
+        with contextlib.redirect_stdout(io.StringIO()), \
+             mock.patch("builtins.input", side_effect=["2", "3.12"]) as inp:
+            self.assertTrue(p.confirm("Proceed?", default=False), "-y answers yes/no confirmations")
+            self.assertEqual(p.checklist("t", [("a", "A"), ("b", "B")]), ["b"], "choices are still asked")
+            self.assertEqual(p.line("Which version? ", "y"), "3.12", "versions are still asked")
+        self.assertEqual(inp.call_count, 2)
+
+    def test_automatic_answers_everything(self):
+        p = cm.Prompt(cm.UI(mute=True), automatic=True)
+        with contextlib.redirect_stdout(io.StringIO()), \
+             mock.patch("builtins.input", side_effect=AssertionError("asked under -blang")):
             self.assertEqual(p.checklist("t", [("a", "A")], default_if_yes=["a"]), ["a"])
             self.assertTrue(p.confirm("ok?", default=True))
             self.assertEqual(p.line("v? ", "y"), "y")
@@ -330,6 +504,9 @@ class DryRunEndToEnd(Base):
         self.assertIn("python3.14", out)
         self.assertIn("sh.rustup.rs", out)
         self.assertNotIn("docker", out.lower())
+        self.assertNotIn("curl -f", out, "every curl must be forced to IPv4 (-4)")
+        self.assertIn("curl -4 ", out)
+        self.assertNotIn("ForceIPv4", out, "IPv4 forcing applies to config-me's curl calls only")
 
     def test_stat_runs(self):
         buf = io.StringIO()
